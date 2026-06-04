@@ -2,7 +2,7 @@ namespace HexWar.Domain.Enums;
 
 public enum NodeType
 {
-    Oupost,         // 일반 점령 대상 
+    OutPost,         // 일반 점령 대상 
     Chokepoint,     // 요충지 (연결도 3 이상)
     SupplyLine,     //보급로 (점령 시 고정 수비대 1기 제공)
     Headquarters    //본부 (점령 불가, 전체 시야)

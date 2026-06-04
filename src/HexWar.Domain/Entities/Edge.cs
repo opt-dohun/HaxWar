@@ -27,7 +27,7 @@ public class Edge
     public void StartTravel(PlayerSide side, int unitCount, NodeId destination)
     {
 
-        int remainingRounds = Distance.RoundRequired;
+        int remainingRounds = Distance.RoundsRequired;
 
         // 잔여 라운드 정보가 없는 경우 추가
         if (!TravelingUnits.ContainsKey(remainingRounds))
@@ -42,37 +42,45 @@ public class Edge
     // 라운드 경과 처리에 따른 
     public List<TravelingGroup> AdvanceRound()
     {
-        // 도착 그룹 정보 저장
         var arrived = new List<TravelingGroup>();
-
-        // 이전 key 정보 정리
-        var KeyToRemove = new List<int>();
+        // SortedList 사용 이유는 새로운 이동 정보를 그래도 복사하기 위하여 
+        var newTraveling = new SortedList<int, List<TravelingGroup>>();
 
         foreach (var kvp in TravelingUnits)
         {
-            // 변경된 라운드 정보 복사
-            int newRemainingRounds = kvp.Key - 1;
+            int newRemaining = kvp.Key - 1;
 
-            // 0 라운드가 맞는 경우
-            if (newRemainingRounds <= 0)
+            if (newRemaining <= 0)
             {
                 arrived.AddRange(kvp.Value);
-                KeyToRemove.Add(kvp.Key);
             }
             else
             {
-                TravelingUnits[newRemainingRounds] = kvp.Value;
-                KeyToRemove.Add(kvp.Key);
+                if (!newTraveling.ContainsKey(newRemaining))
+                    newTraveling[newRemaining] = new List<TravelingGroup>();
+                newTraveling[newRemaining].AddRange(kvp.Value);
             }
         }
 
-        // 라운드 연산 완료 이후 
-        foreach (var key in KeyToRemove)
+        TravelingUnits.Clear();
+        foreach (var kvp in newTraveling)
         {
-            TravelingUnits.Remove(key);
+            TravelingUnits[kvp.Key] = kvp.Value;
         }
 
         return arrived;
+    }
+
+    // 정보 가시성 
+    public bool HasUnitsOfSide(PlayerSide side)
+    {
+        // SelectMany 메서드란 -> 1차원 리스트 안의 리스트를 1차원 리스트로 반환해주는 함수
+        // TravelingUnits.Values -> [List<Group1>, List<Group2>]
+        // SelectMany(g => g) -> [Group1, Group2] 
+
+        // Any 메서드란 -> 리스트에서 조건을 만족하는 값이 하나라도 있으면 true 반환, 없으면 false 반환
+        return TravelingUnits.Values
+            .SelectMany(g => g).Any(g => g.Side == side);
     }
 
     // 조우 여부 확인
@@ -92,4 +100,42 @@ public class Edge
         return false;
     }
 
+    // 모든 조우 찾기
+    public List<EncounterInfo> FindAllEncounters()
+    {
+        var encounters = new List<EncounterInfo>();
+
+        // 간선 내부 모든 유저 순환 
+        foreach (var kvp in TravelingUnits)
+        {
+            // 도착 지점이 동일한 그룹이 2개 이상인지 확인 
+            if (HasEncounter(kvp.Key, out var groups) && groups != null)
+            {
+                // 그룹 A, 그룹 B 찾기
+                var groupA = groups.FirstOrDefault(g => g.Side == PlayerSide.A);
+                var groupB = groups.FirstOrDefault(g => g.Side == PlayerSide.B);
+
+                // 양쪽이 다 존재하는 경우 
+                if (groupA != null && groupB != null)
+                {
+                    encounters.Add(new EncounterInfo(
+                        Id,
+                        groupA,
+                        groupB,
+                        kvp.Key
+                    ));
+                }
+            }
+        }
+        return encounters;
+    }
+
+    // Any 란 -> 리스트에서 조건을 만족하는 값이 하나라도 있으면 true 반환, 없으면 false 반환 
+    // () -> null 조건을 만족하는 값이 없으면 -> true
+    // TravelingUnits.Any() -> 결과가 true면 !false -> false (값이 있으면 -> false) 
+    // TravelingUnits.Any() -> 결과가 false면 !true -> true (값이 없으면 -> true) 
+    // 즉, IsEmpty = true -> (값이 없으면), IsEmpty = false -> (값이 있으면)
+    public bool IsEmpty => !TravelingUnits.Any();
 }
+
+public record EncounterInfo(EdgeId EdgeId, TravelingGroup GroupA, TravelingGroup GroupB, int RemainingRounds);

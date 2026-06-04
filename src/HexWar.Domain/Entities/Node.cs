@@ -7,47 +7,85 @@ public class Node
 {
     public NodeId Id { get; }
     public string Name { get; }
-    public bool IsHeadquarters { get; }
+    public NodeType Type { get; } // 전초기지 유형 표현 추가
+    public bool IsHeadquarters => Type == NodeType.Headquarters;
+    public bool IsSupplyLine => Type == NodeType.SupplyLine;
 
-    // 소유권 상태 
-    // read-only 객체이지만 명시적으로 private set으로 변경
+    // 점유 상태
     public NodeOwnership Ownership { get; set; }
 
-    // 각 플레이어 별 유닛 배치 현황
-    public Dictionary<PlayerSide, int> StationedUnits { get; } = new()
+    // 각 플레이어별 유닛 그룹
+    public Dictionary<PlayerSide, UnitGroup> Units { get; } = new()
     {
-        { PlayerSide.A , 0 },
-        { PlayerSide.B , 0 }
+        { PlayerSide.A , new UnitGroup(PlayerSide.A)  },
+        { PlayerSide.B , new UnitGroup(PlayerSide.B) }
     };
 
+    // 이웃한 노드 정보 List
     public List<NodeId> Neighbors { get; } = new();
 
-    public Node(NodeId id, string name, bool isHeadquarters = false)
+    // 이번 라운드 출발 정보 (상대방에게 공개될 리스트)
+    public List<DepartureAnnouncement> RecentDepartures { get; } = new();
+
+    public Node(NodeId id, string name, NodeType type = NodeType.OutPost)
     {
         Id = id;
         Name = name;
-        IsHeadquarters = isHeadquarters;
+        Type = type;
         Ownership = NodeOwnership.Neutral;
     }
+    public int GetMobileCount(PlayerSide side) => Units[side].MobileCount;
+    public int GetTotalCount(PlayerSide side) => Units[side].TotalCount;
 
-    // 유닛이 도착한 경우 호출하는 메서드
-    public void ArriveUnits(PlayerSide side, int count)
+    // 유닛 도착 처리 
+    public void ArriveMobileUnits(PlayerSide side, int count)
     {
         // 0 이상의 값만 통과할 수 있도록 검증
         if (count <= 0) throw new ArgumentException("Unit count must be positive");
-        StationedUnits[side] += count;
+        Units[side].AddMobile(count);
         UpdateOwnership();
+        ActivateSupplyLineIfNeeded();
     }
 
-    // 유닛이 이동할 경우 호출하는 메서드
-    public void DepartUnits(PlayerSide side, int count)
+    // 유닛 출발 처리
+    public int DepartMobileUnits(PlayerSide side, int requested)
     {
-        // 이동 병력이 충분한지 검사
-        if (StationedUnits[side] < count)
-            throw new InvalidOperationException($"Not enough units at node {Id}. Has: {StationedUnits[side]}, Requested: {count}");
+        // 플레이어 사용가능 병력 
+        int available = GetMobileCount(side);
+        int actual = Math.Min(requested, available);
 
-        StationedUnits[side] -= count;
+        // 이동 병력이 충분한지 검사
+        if (actual <= 0)
+            throw new InvalidOperationException($"No mobile units at node {Id} for {side}");
+
+        Units[side].RemoveMobile(actual);
+        RecentDepartures.Add(new DepartureAnnouncement(Id, actual));
         UpdateOwnership();
+
+        return actual;
+    }
+
+    // 보급로 활성화 확인
+    private void ActivateSupplyLineIfNeeded()
+    {
+        if (!IsSupplyLine) return;
+
+        // 점유 중인 플레이어 확인
+        if (Ownership == NodeOwnership.PlayerA)
+            Units[PlayerSide.A].SetGarrison(1);
+        else if (Ownership == NodeOwnership.PlayerB)
+            Units[PlayerSide.B].SetGarrison(1);
+    }
+
+    // 보급로 상실 확인
+    private void DeactivateSupplyLine()
+    {
+        if (!IsSupplyLine) return;
+
+        if (Ownership != NodeOwnership.PlayerA)
+            Units[PlayerSide.A].SetGarrison(0);
+        if (Ownership != NodeOwnership.PlayerB)
+            Units[PlayerSide.B].SetGarrison(0);
     }
 
     public void UpdateOwnership()
@@ -59,8 +97,10 @@ public class Node
             return;
         }
 
-        int countA = StationedUnits[PlayerSide.A];
-        int countB = StationedUnits[PlayerSide.B];
+        int countA = GetTotalCount(PlayerSide.A);
+        int countB = GetTotalCount(PlayerSide.B);
+
+        NodeOwnership previousOwnership = Ownership;
 
         if (countA == 0 && countB == 0)
         {
@@ -79,16 +119,19 @@ public class Node
             Ownership = NodeOwnership.Contested;
         }
 
+        if (previousOwnership != Ownership)
+        {
+            DeactivateSupplyLine();
+            ActivateSupplyLineIfNeeded();
+        }
+
     }
 
-
-
-
-
-
-
-
-
-
-
+    // 라운드 내 출발 기록 초기화 
+    public void ClearDepartureHistory()
+    {
+        RecentDepartures.Clear();
+    }
 }
+
+public record DepartureAnnouncement(NodeId FromNode, int UnitCount);
