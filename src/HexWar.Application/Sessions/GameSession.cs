@@ -1,7 +1,9 @@
 // src/HexWar.Application/Sessions/GameSession.cs
+// HexWar.Matchmaking의 GameRoomService에서 참조하기 위해 InternalsVisibleTo 설정
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("HexWar.Matchmaking")]
+
 namespace HexWar.Application.Sessions;
 
-using System.Timers;
 using HexWar.Application.Commands;
 using HexWar.Application.Queries;
 using HexWar.Application.Services;
@@ -24,11 +26,11 @@ public class GameSession : IDisposable
     private readonly IEventBroadcaster _eventBroadcaster;
     private readonly IGameRoomRepository _repository;
     private readonly Dictionary<PlayerSide, PlayerSessionState> _playerStates;
-
     private Timer? _planningTimer;
     private readonly TimeSpan _planningTimeout;
     private const int DefaultPlanningTimeoutSeconds = 30;
 
+    // 플레이어 별 개별락 도입 고려 [TODO]
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public string RoomId => _gameRoom.RoomId;
@@ -37,6 +39,16 @@ public class GameSession : IDisposable
 
     public event EventHandler<GameOverEventArgs>? OnGameOver;
     public event EventHandler<RoundResolvedEventArgs>? OnRoundResolved;
+
+    // 동일한 프로젝트 내에서만 접근을 허용하기위한 키워드
+    internal GameRoom GetGameRoom() => _gameRoom;
+
+    // 동일한 프로젝트 내에서만 접근을 허용하기위한 키워드
+    internal DateTime? LastActivityAt { get; private set; }
+
+    // 이벤트 버퍼 [ 재연결 시 시퀀스 번호에 따라 보정 처리 ]
+    private readonly CircularBuffer<BufferedEvent> _eventBuffer = new(200);
+    private long _eventSequence = 0;
 
     public GameSession(
         GameRoom gameRoom,
@@ -64,6 +76,16 @@ public class GameSession : IDisposable
         {
             _playerStates[side].IsConnected = true;
             _playerStates[side].MarkActivity();
+
+            // 첫 번째 라운드이고 계획 단계일 때 양쪽 플레이어가 모두 연결되면 계획 타이머 시작
+            if (_gameRoom.Phase == GamePhase.Planning && _planningTimer == null)
+            {
+                if (_playerStates.Values.All(p => p.IsConnected))
+                {
+                    StartPlanningTimer();
+                }
+            }
+
             await _repository.SaveAsync(_gameRoom);
         }
         finally
@@ -123,7 +145,7 @@ public class GameSession : IDisposable
             var moveResult = _gameRoom.MoveUnits(side, adjustedCommand);
 
             // 상태 업데이트
-            _playerStates[side].MoveCommandCompleted = _gameRoom.GetRemainingUnits(side) <= 0;
+            _playerStates[side].MoveCommandCompleted = IsMoveCommandCompleted(side);
 
             // 이벤트 브로드캐스트
             await BroadcastEventsAsync();
@@ -203,9 +225,9 @@ public class GameSession : IDisposable
                     ToNodeId = m.To.Value,
                     UnitCount = m.Count
                 }).ToList(),
-            MoveCommandCompleted = _playerStates[side].MoveCommandCompleted,
+            MoveCommandCompleted = IsMoveCommandCompleted(side),
             EncounterDecisionsCompleted = _playerStates[side].EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(side).Any(),
-            IsMyPlanningComplete = _playerStates[side].MoveCommandCompleted && (_playerStates[side].EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(side).Any()),
+            IsMyPlanningComplete = IsMoveCommandCompleted(side) && (_playerStates[side].EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(side).Any()),
 
             // 노드
             Nodes = _gameRoom.Nodes.Values.Select(node =>
@@ -343,7 +365,7 @@ public class GameSession : IDisposable
 
         bool allReady = _playerStates.Values
             .Where(s => s.IsConnected)
-            .All(s => s.MoveCommandCompleted && (s.EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(s.Side).Any()));
+            .All(s => IsMoveCommandCompleted(s.Side) && (s.EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(s.Side).Any()));
 
         if (allReady)
         {
@@ -449,77 +471,73 @@ public class GameSession : IDisposable
     }
 
     // 이벤트 브로드캐스트
+    // 변경: 이벤트를 버퍼에 저장하고 모든 플레이어에게 동시 전송
     private async Task BroadcastEventsAsync()
     {
+        // 이벤트 복사 작업 
         var events = _gameRoom.DomainEvents.ToList();
         if (!events.Any()) return;
 
         foreach (var domainEvent in events)
         {
-            await BroadcastSingleEventAsync(domainEvent);
+            // 1. 시퀀스 번호 부여 및 버퍼 저장
+            // Interlocked을 이용하여 원자적으로 값이 증가하도록 보장 
+            // ref 안전한 포인터를 전달
+            var sequenceNumber = Interlocked.Increment(ref _eventSequence);
+            _eventBuffer.Add(new BufferedEvent
+            {
+                SequenceNumber = sequenceNumber,
+                Event = domainEvent,
+                Timestamp = DateTime.UtcNow
+            });
+
+            // 2. 브로드 캐스트 진행 [시퀀스 번호를 전달하여 재연결 시 누락된 데이터 동기화 진행용 ]
+            await BroadcastSingleEventAsync(domainEvent, sequenceNumber);
         }
 
         _gameRoom.ClearDomainEvents();
     }
 
-    private async Task BroadcastSingleEventAsync(IDomainEvent domainEvent)
+    // [버퍼링된 이벤트 조회]  재연결 클라이언트용 메서드 
+    public List<BufferedEvent> GetEventsAfter(long lastSeenSequence)
+    {
+        return _eventBuffer
+            .Where(e => e.SequenceNumber > lastSeenSequence)
+            .OrderBy(e => e.SequenceNumber)
+            .ToList();
+    }
+
+    // 마지막 시퀀스 번호 반환     
+    public long GetLastSequenceNumber() => _eventSequence;
+
+    private async Task BroadcastSingleEventAsync(IDomainEvent domainEvent, long sequenceNumber)
     {
         switch (domainEvent)
         {
-            case GameStarted:
-            case RoundStarted:
-            case RoundResolved:
-            case GameOver:
-            case UnitsRetreated:
-            case UnitsAdvanced:
-            case EncounterOccurred:
-            case EncounterResolved:
-                await _eventBroadcaster.BroadcastToRoomAsync(RoomId, domainEvent);
+            // RoundResolved 하나로 모든 해소 결과 전달
+            case RoundResolved resolved:
+                await _eventBroadcaster.BroadcastToRoomAsync(RoomId, resolved, sequenceNumber);
                 break;
 
+            // Planning 단계 이벤트만 개별 전송
             case UnitsDeparted departed:
-                // 제네릭 오버로드로 DTO 전송
-                await _eventBroadcaster.BroadcastToRoomAsync(RoomId, departed.ToPublicInfo());
-                break;
-
-            case UnitsArrived arrived:
-                await BroadcastUnitsArrivedAsync(arrived);
+                await _eventBroadcaster.BroadcastToRoomAsync(RoomId, departed.ToPublicInfo(), sequenceNumber);
                 break;
 
             case EncounterDecisionMade decisionMade:
-                await _eventBroadcaster.SendToPlayerAsync(RoomId, decisionMade.DecidingPlayer, domainEvent);
+                await _eventBroadcaster.SendToPlayerAsync(RoomId, decisionMade.DecidingPlayer, decisionMade, sequenceNumber);
                 break;
 
+            case GameStarted:
+            case RoundStarted:
+            case GameOver:
+                await _eventBroadcaster.BroadcastToRoomAsync(RoomId, domainEvent, sequenceNumber);
+                break;
+
+            // UnitsArrived, UnitsRetreated 등은 RoundResolved에 포함되어 있으므로
+            // 별도 브로드캐스트하지 않음 (버퍼에만 저장)
             default:
-                await _eventBroadcaster.BroadcastToRoomAsync(RoomId, domainEvent);
                 break;
-        }
-    }
-
-    private async Task BroadcastUnitsArrivedAsync(UnitsArrived arrived)
-    {
-        foreach (var side in new[] { PlayerSide.A, PlayerSide.B })
-        {
-            if (!_gameRoom.Players.ContainsKey(side)) continue;
-
-            bool hasHQVision = HasHeadquartersVision(side);
-            bool isOwnUnits = arrived.Side == side;
-
-            if (hasHQVision || isOwnUnits)
-            {
-                await _eventBroadcaster.SendToPlayerAsync(RoomId, side, arrived);
-            }
-            else
-            {
-                var summary = new UnitsArrivedSummary(
-                    RoomId,
-                    arrived.DestinationNode,
-                    arrived.Side,
-                    arrived.UnitCount,
-                    arrived.RoundNumber
-                );
-                await _eventBroadcaster.SendToPlayerAsync(RoomId, side, summary);
-            }
         }
     }
 
@@ -540,6 +558,13 @@ public class GameSession : IDisposable
         if (nodesA > nodesB) return PlayerSide.A.ToString();
         if (nodesB > nodesA) return PlayerSide.B.ToString();
         return "Draw";
+    }
+
+    private bool IsMoveCommandCompleted(PlayerSide side)
+    {
+        return _playerStates[side].MoveCommandCompleted ||
+               _gameRoom.GetRemainingUnits(side) <= 0 ||
+               _gameRoom.Nodes.Values.Sum(n => n.GetMobileCount(side)) == 0;
     }
 
     public void Dispose()

@@ -5,11 +5,11 @@ using HexWar.Domain.Events;
 
 public interface IEventBroadcaster
 {
-    Task BroadcastToRoomAsync(string roomId, IDomainEvent domainEvent);
+    Task BroadcastToRoomAsync(string roomId, IDomainEvent domainEvent, long sequenceNumber = 0);
 
-    Task BroadcastToRoomAsync<T>(string roomId, T message) where T : class;
+    Task BroadcastToRoomAsync<T>(string roomId, T message, long sequenceNumber = 0) where T : class;
 
-    Task SendToPlayerAsync(string roomId, PlayerSide side, IDomainEvent domainEvent);
+    Task SendToPlayerAsync(string roomId, PlayerSide side, IDomainEvent domainEvent, long sequenceNumber = 0);
 
-    Task SendToPlayerAsync<T>(string roomId, PlayerSide side, T message) where T : class;
+    Task SendToPlayerAsync<T>(string roomId, PlayerSide side, T message, long sequenceNumber = 0) where T : class;
 }
