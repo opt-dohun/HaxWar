@@ -570,6 +570,11 @@ public class GameSession : IDisposable
     public void Dispose()
     {
         StopPlanningTimer();
+        _eventBuffer.Dispose();
         _lock.Dispose();
+
+        // 이벤트 핸들러 참조 해제 
+        OnGameOver = null;
+        OnRoundResolved = null;
     }
 }

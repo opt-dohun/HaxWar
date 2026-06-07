@@ -74,6 +74,17 @@ public class CircularBuffer<T> : IEnumerable<T>
 
     // IEnumerable<T>가 아닌 IEnumerable<T>를 상속받지 않은 타입인 IEnumerable 인터페이스를 구현하기 위해 필요함.
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+    // 명시적 자원해제를 위해 IDisposable 구현
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            System.Array.Clear(_buffer, 0, _buffer.Length);
+            _head = 0;
+            _count = 0;
+        }
+    }
 }
 
 public class BufferedEvent
