@@ -4,6 +4,7 @@ namespace HexWar.Infrastructure.Persistence;
 using System.Text.Json;
 using HexWar.Application.Services;
 using HexWar.Domain.Entities;
+using HexWar.Infrastructure.Serialization;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 
@@ -19,12 +20,7 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
     private readonly RedisConfiguration _config;
     private readonly ILogger<RedisGameRoomRepository> _logger;
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = true,
-        WriteIndented = false
-    };
+    private static readonly JsonSerializerOptions JsonOptions = DomainJsonOptions.Create();
 
     public RedisGameRoomRepository(
         RedisConfiguration config,
@@ -50,10 +46,6 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
         }
     }
 
-    // ============================================================
-    // IGameRoomRepository 구현
-    // ============================================================
-
     public async Task<GameRoom?> GetByIdAsync(string roomId)
     {
         try
@@ -63,7 +55,16 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
 
             if (value.IsNullOrEmpty) return null;
 
-            return JsonSerializer.Deserialize<GameRoom>(value!, JsonOptions);
+            var gameRoom = JsonSerializer.Deserialize<GameRoom>(value!, JsonOptions);
+
+            if (gameRoom != null)
+            {
+                _logger.LogDebug(
+                    "Restored GameRoom {RoomId}: Phase={Phase}, Round={Round}, Nodes={NodeCount}",
+                    roomId, gameRoom.Phase, gameRoom.CurrentRound, gameRoom.Nodes.Count);
+            }
+
+            return gameRoom;
         }
         catch (Exception ex)
         {
@@ -77,26 +78,23 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
         try
         {
             var key = GetRoomKey(gameRoom.RoomId);
+
+            // DomainJsonOptions 사용
             var json = JsonSerializer.Serialize(gameRoom, JsonOptions);
+
+            _logger.LogDebug(
+                "Saving GameRoom {RoomId}: {JsonLength} bytes",
+                gameRoom.RoomId, json.Length);
 
             var expiry = gameRoom.Phase == Domain.Enums.GamePhase.GameOver
                 ? TimeSpan.FromMinutes(_config.GameOverExpiryMinutes)
                 : TimeSpan.FromMinutes(_config.GameSessionExpiryMinutes);
 
             await _db.StringSetAsync(key, json, expiry);
-
-            // 메타데이터 별도 저장 (빠른 조회용)
-            await _db.HashSetAsync(GetRoomMetaKey(gameRoom.RoomId), new HashEntry[]
-            {
-                new("phase", gameRoom.Phase.ToString()),
-                new("round", gameRoom.CurrentRound),
-                new("updated_at", DateTime.UtcNow.ToString("O"))
-            });
-            await _db.KeyExpireAsync(GetRoomMetaKey(gameRoom.RoomId), expiry);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to save GameRoom {RoomId} to Redis", gameRoom.RoomId);
+            _logger.LogError(ex, "Failed to serialize/save GameRoom {RoomId}", gameRoom.RoomId);
         }
     }
 
@@ -112,9 +110,6 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
         }
     }
 
-    // ============================================================
-    // Redis 전용 확장 기능
-    // ============================================================
 
     /// <summary>
     /// 플레이어 세션 정보 저장
