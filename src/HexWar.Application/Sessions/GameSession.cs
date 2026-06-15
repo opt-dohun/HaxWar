@@ -40,8 +40,7 @@ public class GameSession : IDisposable
     public event EventHandler<GameOverEventArgs>? OnGameOver;
     public event EventHandler<RoundResolvedEventArgs>? OnRoundResolved;
 
-    // 동일한 프로젝트 내에서만 접근을 허용하기위한 키워드
-    internal GameRoom GetGameRoom() => _gameRoom;
+    public GameRoom GetGameRoom() => _gameRoom;
 
     // 동일한 프로젝트 내에서만 접근을 허용하기위한 키워드
     public DateTime? LastActivityAt { get; private set; }

@@ -29,8 +29,8 @@ public class InMemoryEventBroadcaster : IEventBroadcaster
         var serverMessage = ServerMessage.FromDomainEvent(
             domainEvent, roomId, _getCurrentRound(roomId), sequenceNumber);
 
-        var json = JsonSerializer.Serialize(serverMessage, JsonOptions.Default);
-        await _connectionManager.BroadcastToRoomAsync(roomId, json);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(serverMessage, JsonOptions.Default);
+        await _connectionManager.BroadcastToRoomAsync(roomId, bytes);
     }
 
     /// <inheritdoc />
@@ -39,8 +39,8 @@ public class InMemoryEventBroadcaster : IEventBroadcaster
         var eventType = typeof(T).Name;
         var serverMessage = ServerMessage.FromDto(message, eventType, _getCurrentRound(roomId), sequenceNumber);
 
-        var json = JsonSerializer.Serialize(serverMessage, JsonOptions.Default);
-        await _connectionManager.BroadcastToRoomAsync(roomId, json);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(serverMessage, JsonOptions.Default);
+        await _connectionManager.BroadcastToRoomAsync(roomId, bytes);
     }
 
     /// <inheritdoc />
@@ -49,8 +49,8 @@ public class InMemoryEventBroadcaster : IEventBroadcaster
         var serverMessage = ServerMessage.FromDomainEvent(
             domainEvent, roomId, _getCurrentRound(roomId), sequenceNumber);
 
-        var json = JsonSerializer.Serialize(serverMessage, JsonOptions.Default);
-        await _connectionManager.SendToPlayerAsync(roomId, side.ToString(), json);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(serverMessage, JsonOptions.Default);
+        await _connectionManager.SendToPlayerAsync(roomId, side.ToString(), bytes);
     }
 
     /// <inheritdoc />
@@ -59,7 +59,7 @@ public class InMemoryEventBroadcaster : IEventBroadcaster
         var eventType = typeof(T).Name;
         var serverMessage = ServerMessage.FromDto(message, eventType, _getCurrentRound(roomId), sequenceNumber);
 
-        var json = JsonSerializer.Serialize(serverMessage, JsonOptions.Default);
-        await _connectionManager.SendToPlayerAsync(roomId, side.ToString(), json);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(serverMessage, JsonOptions.Default);
+        await _connectionManager.SendToPlayerAsync(roomId, side.ToString(), bytes);
     }
 }

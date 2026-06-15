@@ -129,12 +129,17 @@ public class ConnectionManager
     // 특정 플레이어에게 메시지 전송     
     public async Task SendToPlayerAsync(string roomId, string playerSide, string message)
     {
+        var bytes = Encoding.UTF8.GetBytes(message);
+        await SendToPlayerAsync(roomId, playerSide, bytes);
+    }
+
+    public async Task SendToPlayerAsync(string roomId, string playerSide, ReadOnlyMemory<byte> messageBytes)
+    {
         var socket = GetConnection(roomId, playerSide);
         if (socket == null || socket.State != WebSocketState.Open) return;
 
-        var buffer = Encoding.UTF8.GetBytes(message);
         await socket.SendAsync(
-            new ArraySegment<byte>(buffer),
+            messageBytes,
             WebSocketMessageType.Text,
             endOfMessage: true,
             CancellationToken.None);
@@ -142,6 +147,12 @@ public class ConnectionManager
 
     // 해당 방의 모든 사용자에게 메시지 전송 
     public async Task BroadcastToRoomAsync(string roomId, string message)
+    {
+        var bytes = Encoding.UTF8.GetBytes(message);
+        await BroadcastToRoomAsync(roomId, bytes);
+    }
+
+    public async Task BroadcastToRoomAsync(string roomId, ReadOnlyMemory<byte> messageBytes)
     {
         var connections = GetRoomConnections(roomId);
 
@@ -151,9 +162,8 @@ public class ConnectionManager
             {
                 if (socket.State == WebSocketState.Open)
                 {
-                    var buffer = Encoding.UTF8.GetBytes(message);
                     await socket.SendAsync(
-                        new ArraySegment<byte>(buffer),
+                        messageBytes,
                         WebSocketMessageType.Text,
                         endOfMessage: true,
                         CancellationToken.None);

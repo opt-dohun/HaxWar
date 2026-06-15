@@ -69,33 +69,111 @@ public class GameWebSocketHandler
         GameSession session,
         PlayerSide side)
     {
-        var buffer = new byte[1024 * 4]; // 4KB
+        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(1024 * 4); // 4KB
 
-        while (webSocket.State == WebSocketState.Open)
+        try
         {
-            WebSocketReceiveResult result;
-            using var ms = new MemoryStream();
-
-            do
+            while (webSocket.State == WebSocketState.Open)
             {
-                result = await webSocket.ReceiveAsync(
-                    new ArraySegment<byte>(buffer), CancellationToken.None);
-                ms.Write(buffer, 0, result.Count);
-            }
-            while (!result.EndOfMessage);
+                var firstResult = await webSocket.ReceiveAsync(
+                    buffer.AsMemory(), CancellationToken.None);
 
-            if (result.MessageType == WebSocketMessageType.Close)
-            {
-                await webSocket.CloseAsync(
-                    WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
-                break;
-            }
+                if (firstResult.MessageType == WebSocketMessageType.Close)
+                {
+                    await webSocket.CloseAsync(
+                        WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                    break;
+                }
 
-            if (result.MessageType == WebSocketMessageType.Text)
-            {
-                var message = Encoding.UTF8.GetString(ms.ToArray());
-                await ProcessMessageAsync(webSocket, session, side, message);
+                if (firstResult.MessageType == WebSocketMessageType.Text)
+                {
+                    if (firstResult.EndOfMessage)
+                    {
+                        // Fast path: fits in one receive buffer chunk. No MemoryStream allocated.
+                        try
+                        {
+                            var clientMessage = JsonSerializer.Deserialize<ClientMessage>(
+                                buffer.AsSpan(0, firstResult.Count), JsonOptions.Default);
+                            if (clientMessage != null)
+                            {
+                                await ProcessMessageAsync(webSocket, session, side, clientMessage);
+                            }
+                            else
+                            {
+                                await SendErrorAsync(webSocket, "Invalid message format");
+                            }
+                        }
+                        catch (JsonException)
+                        {
+                            await SendErrorAsync(webSocket, "Invalid JSON");
+                        }
+                        catch (Exception ex)
+                        {
+                            await SendErrorAsync(webSocket, $"Internal error: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        // Slow path: multi-packet message. Fallback to MemoryStream.
+                        using var ms = new MemoryStream();
+                        ms.Write(buffer, 0, firstResult.Count);
+
+                        System.Net.WebSockets.ValueWebSocketReceiveResult loopResult;
+                        do
+                        {
+                            loopResult = await webSocket.ReceiveAsync(
+                                buffer.AsMemory(), CancellationToken.None);
+                            ms.Write(buffer, 0, loopResult.Count);
+                        }
+                        while (!loopResult.EndOfMessage);
+
+                        if (loopResult.MessageType == WebSocketMessageType.Close)
+                        {
+                            await webSocket.CloseAsync(
+                                WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                            break;
+                        }
+
+                        ms.Position = 0;
+                        try
+                        {
+                            var clientMessage = await JsonSerializer.DeserializeAsync<ClientMessage>(ms, JsonOptions.Default);
+                            if (clientMessage != null)
+                            {
+                                await ProcessMessageAsync(webSocket, session, side, clientMessage);
+                            }
+                            else
+                            {
+                                await SendErrorAsync(webSocket, "Invalid message format");
+                            }
+                        }
+                        catch (JsonException)
+                        {
+                            await SendErrorAsync(webSocket, "Invalid JSON");
+                        }
+                        catch (Exception ex)
+                        {
+                            await SendErrorAsync(webSocket, $"Internal error: {ex.Message}");
+                        }
+                    }
+                }
             }
+        }
+        catch (WebSocketException ex)
+        {
+            _logger.LogInformation("WebSocket connection closed for Room={RoomId}, Player={Side}: {Message}", session.RoomId, side, ex.Message);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("WebSocket connection cancelled for Room={RoomId}, Player={Side}", session.RoomId, side);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in WebSocket receive loop for Room={RoomId}, Player={Side}", session.RoomId, side);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -106,54 +184,38 @@ public class GameWebSocketHandler
         System.Net.WebSockets.WebSocket webSocket,
         GameSession session,
         PlayerSide side,
-        string rawMessage)
+        ClientMessage clientMessage)
     {
-        _logger.LogInformation("[WS] Received from Room={RoomId}, Player={Side}: {Message}", session.RoomId, side, rawMessage);
-        try
+        if (_logger.IsEnabled(LogLevel.Debug))
         {
-            var clientMessage = JsonSerializer.Deserialize<ClientMessage>(
-                rawMessage, JsonOptions.Default);
-
-            if (clientMessage == null)
-            {
-                await SendErrorAsync(webSocket, "Invalid message format");
-                return;
-            }
-
-            switch (clientMessage.Type)
-            {
-                case ClientMessageTypes.MoveUnits:
-                    await HandleMoveUnitsAsync(webSocket, session, side, clientMessage.Payload);
-                    break;
-
-                case ClientMessageTypes.EncounterDecision:
-                    await HandleEncounterDecisionAsync(webSocket, session, side, clientMessage.Payload);
-                    break;
-
-                case ClientMessageTypes.GetState:
-                    await HandleGetStateAsync(webSocket, session, side);
-                    break;
-
-                case ClientMessageTypes.Ping:
-                    await SendPongAsync(webSocket);
-                    break;
-
-                case ClientMessageTypes.ReconnectSync:
-                    await HandleReconnectSyncAsync(webSocket, session, side, clientMessage.Payload);
-                    break;
-
-                default:
-                    await SendErrorAsync(webSocket, $"Unknown message type: {clientMessage.Type}");
-                    break;
-            }
+            _logger.LogDebug("[WS] Received from Room={RoomId}, Player={Side}: Type={Type}", session.RoomId, side, clientMessage.Type);
         }
-        catch (JsonException)
+        
+        switch (clientMessage.Type)
         {
-            await SendErrorAsync(webSocket, "Invalid JSON");
-        }
-        catch (Exception ex)
-        {
-            await SendErrorAsync(webSocket, $"Internal error: {ex.Message}");
+            case ClientMessageTypes.MoveUnits:
+                await HandleMoveUnitsAsync(webSocket, session, side, clientMessage.Payload);
+                break;
+
+            case ClientMessageTypes.EncounterDecision:
+                await HandleEncounterDecisionAsync(webSocket, session, side, clientMessage.Payload);
+                break;
+
+            case ClientMessageTypes.GetState:
+                await HandleGetStateAsync(webSocket, session, side);
+                break;
+
+            case ClientMessageTypes.Ping:
+                await SendPongAsync(webSocket);
+                break;
+
+            case ClientMessageTypes.ReconnectSync:
+                await HandleReconnectSyncAsync(webSocket, session, side, clientMessage.Payload);
+                break;
+
+            default:
+                await SendErrorAsync(webSocket, $"Unknown message type: {clientMessage.Type}");
+                break;
         }
     }
 
@@ -246,8 +308,8 @@ public class GameWebSocketHandler
             Round = session.CurrentRound
         };
 
-        var json = JsonSerializer.Serialize(serverMessage, JsonOptions.Default);
-        await SendTextAsync(webSocket, json);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(serverMessage, JsonOptions.Default);
+        await SendTextAsync(webSocket, bytes);
     }
 
     private async Task BroadcastStateAsync(GameSession session)
@@ -267,8 +329,8 @@ public class GameWebSocketHandler
                     Round = session.CurrentRound
                 };
 
-                var json = JsonSerializer.Serialize(serverMessage, JsonOptions.Default);
-                await SendTextAsync(socket, json);
+                var bytes = JsonSerializer.SerializeToUtf8Bytes(serverMessage, JsonOptions.Default);
+                await SendTextAsync(socket, bytes);
             }
         }
     }
@@ -277,15 +339,17 @@ public class GameWebSocketHandler
     // 응답 헬퍼
     // ========================================================================
 
-    private async Task SendTextAsync(System.Net.WebSockets.WebSocket webSocket, string message)
+    private async Task SendTextAsync(System.Net.WebSockets.WebSocket webSocket, ReadOnlyMemory<byte> messageBytes)
     {
         if (webSocket.State != WebSocketState.Open) return;
 
-        _logger.LogInformation("[WS] Sending: {Message}", message);
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug("[WS] Sending: {Message}", Encoding.UTF8.GetString(messageBytes.Span));
+        }
 
-        var buffer = Encoding.UTF8.GetBytes(message);
         await webSocket.SendAsync(
-            new ArraySegment<byte>(buffer),
+            messageBytes,
             WebSocketMessageType.Text,
             endOfMessage: true,
             CancellationToken.None);
@@ -301,8 +365,8 @@ public class GameWebSocketHandler
             Timestamp = DateTime.UtcNow
         };
 
-        var json = JsonSerializer.Serialize(errorMessage, JsonOptions.Default);
-        await SendTextAsync(webSocket, json);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(errorMessage, JsonOptions.Default);
+        await SendTextAsync(webSocket, bytes);
     }
 
     private async Task SendPongAsync(System.Net.WebSockets.WebSocket webSocket)
@@ -313,12 +377,12 @@ public class GameWebSocketHandler
             Timestamp = DateTime.UtcNow
         };
 
-        var json = JsonSerializer.Serialize(pongMessage, JsonOptions.Default);
-        await SendTextAsync(webSocket, json);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(pongMessage, JsonOptions.Default);
+        await SendTextAsync(webSocket, bytes);
     }
 
     private async Task HandleReconnectSyncAsync(
-    WebSocket webSocket, GameSession session, PlayerSide side, JsonElement payload)
+        WebSocket webSocket, GameSession session, PlayerSide side, JsonElement payload)
     {
         var syncPayload = JsonSerializer.Deserialize<ReconnectSyncPayload>(
             payload.GetRawText(), JsonOptions.Default);
@@ -338,8 +402,8 @@ public class GameWebSocketHandler
                 SequenceNumber = buffered.SequenceNumber,
                 Timestamp = buffered.Timestamp
             };
-            var json = JsonSerializer.Serialize(message, JsonOptions.Default);
-            await SendTextAsync(webSocket, json);
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(message, JsonOptions.Default);
+            await SendTextAsync(webSocket, bytes);
         }
 
         // 현재 상태도 전송
@@ -352,7 +416,7 @@ public class GameWebSocketHandler
             Timestamp = DateTime.UtcNow,
             Round = session.CurrentRound
         };
-        var stateJson = JsonSerializer.Serialize(stateMessage, JsonOptions.Default);
-        await SendTextAsync(webSocket, stateJson);
+        var stateBytes = JsonSerializer.SerializeToUtf8Bytes(stateMessage, JsonOptions.Default);
+        await SendTextAsync(webSocket, stateBytes);
     }
 }

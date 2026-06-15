@@ -89,15 +89,15 @@ public class SessionCleanupService : BackgroundService
     private async Task CleanupConnectionsAsync(string roomId)
     {
         // 방에 연결된 플레이어들에게 게임 종료 알림 전송
-        var disconnectMessage = System.Text.Json.JsonSerializer.Serialize(new
+        var disconnectMessageBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new
         {
             type = "game_event",
             event_type = "SessionClosed",
             payload = new { roomId, reason = "session_cleaned" },
             timestamp = DateTime.UtcNow
-        });
+        }, JsonOptions.Default);
 
-        await _connectionManager.BroadcastToRoomAsync(roomId, disconnectMessage);
+        await _connectionManager.BroadcastToRoomAsync(roomId, disconnectMessageBytes);
 
         // 약간의 지연 후 연결 종료 (메시지 전송 시간 확보)
         await Task.Delay(500);
