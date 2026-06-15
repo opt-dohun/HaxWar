@@ -57,4 +57,19 @@ public class EdgeIdJsonConverter : JsonConverter<EdgeId>
     {
         writer.WriteStringValue(value.Key);
     }
+
+    public override EdgeId ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var str = reader.GetString();
+        if (str == null) throw new JsonException("Null edge ID");
+        var parts = str.Split('-');
+        return new EdgeId(
+            new NodeId(int.Parse(parts[0])),
+            new NodeId(int.Parse(parts[1])));
+    }
+
+    public override void WriteAsPropertyName(Utf8JsonWriter writer, EdgeId value, JsonSerializerOptions options)
+    {
+        writer.WritePropertyName(value.Key);
+    }
 }

@@ -46,4 +46,14 @@ public class PlayerIdJsonConverter : JsonConverter<PlayerId>
     {
         writer.WriteStringValue(value.Value);
     }
+
+    public override PlayerId ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return new PlayerId(reader.GetString() ?? string.Empty);
+    }
+
+    public override void WriteAsPropertyName(Utf8JsonWriter writer, PlayerId value, JsonSerializerOptions options)
+    {
+        writer.WritePropertyName(value.Value);
+    }
 }

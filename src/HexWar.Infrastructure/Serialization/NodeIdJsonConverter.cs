@@ -45,4 +45,26 @@ public class NodeIdJsonConverter : JsonConverter<NodeId>
     {
         writer.WriteNumberValue(value.Value);
     }
+
+    public override NodeId ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var str = reader.GetString();
+        if (str != null)
+        {
+            if (str.StartsWith('N') || str.StartsWith('n'))
+            {
+                str = str.Substring(1);
+            }
+            if (int.TryParse(str, out var val))
+            {
+                return new NodeId(val);
+            }
+        }
+        throw new JsonException($"Cannot deserialize '{str}' as NodeId property name");
+    }
+
+    public override void WriteAsPropertyName(Utf8JsonWriter writer, NodeId value, JsonSerializerOptions options)
+    {
+        writer.WritePropertyName(value.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
 }
