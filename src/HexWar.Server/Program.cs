@@ -8,9 +8,29 @@ using HexWar.Server.WebSocket;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Redis 세팅 진행 
+var redisConfig = new RedisConfiguration();
+builder.Configuration.GetSection(RedisConfiguration.SectionName).Bind(redisConfig);
+
+builder.Services.AddSingleton(redisConfig);
+
+try
+{
+    var redisRepo = new RedisGameRoomRepository(
+        redisConfig,
+        builder.Services.BuildServiceProvider().GetRequiredService<ILogger<RedisGameRoomRepository>>());
+
+    builder.Services.AddSingleton<IGameRoomRepository>(redisRepo);
+    Console.WriteLine("✅ Using Redis repository");
+}
+catch (Exception)
+{
+    Console.WriteLine("⚠️ Redis unavailable, falling back to in-memory repository");
+    builder.Services.AddSingleton<IGameRoomRepository, InMemoryGameRoomRepository>();
+}
+
 // 공통 서비스 (WebSocket + gRPC에서 공유)
 builder.Services.AddSingleton<ConnectionManager>();
-builder.Services.AddSingleton<IGameRoomRepository, InMemoryGameRoomRepository>();
 builder.Services.AddSingleton<SessionRegistry>();
 builder.Services.AddSingleton<MatchmakingQueue>();
 

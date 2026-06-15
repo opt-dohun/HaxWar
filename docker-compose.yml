@@ -1,14 +1,52 @@
 version: '3.8'
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: hexwar-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+      --save 60 1
+      --loglevel notice
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: '300M'
+        reservations:
+          cpus: '0.25'
+          memory: '100M'
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    networks:
+      - hexwar-network
   hexwar-server:
     build:
       context: .
       dockerfile: src/HexWar.Server/Dockerfile
+    container_name: hexwar-server
     ports:
-      - "5000:5000"
+      - "5020:5000"
       - "5001:5001"
-    
+    depends_on:
+      redis:
+        condition: service_healthy  # Redis가 정상 실행된 후 시작
     # 리소스 제한 (하드웨어 사양 시뮬레이션)
     deploy:
       resources:
@@ -25,7 +63,8 @@ services:
       - ASPNETCORE_URLS=http://+:5000
       - DOTNET_GCServer=1
       - DOTNET_GCHeapCount=2          # 2코어에 맞춤
-    
+      - Redis__ConnectionString=redis:6379          # Redis 연결 문자열
+      - ConnectionStrings__Redis=redis:6379          # 대체 키
     # 헬스체크
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/api/diagnostics/stats"]
@@ -33,10 +72,20 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    
+  
     # 로깅
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+    networks:
+      - hexwar-network
+
+volumes:
+  redis-data:
+    driver: local
+
+networks:
+  hexwar-network:
+    driver: bridge
