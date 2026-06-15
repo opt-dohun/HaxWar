@@ -15,6 +15,12 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 최대 성능을 위해 GC 설정 -->
+    <!-- ServerGarbageCollection은 서버에 최적화 성능을 높이기 위하여 논리 CPU에 대하 전송 쓰레드와 수집 대상 힙을 제공한다. 이를 통해 프로세스 각각에 대해 독립적인 GC가 동작한다. -->
+    <!-- 독립적으로 동작하는 이유는 동시에 가비지를 수집하게 되면 렉이 발생하기 때문이다. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- ConcurrentGarbageCollection은 병렬 GC를 활성화하여 GC 일시 중지 시간을 줄입니다. -->
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>

@@ -47,6 +47,17 @@ builder.Services.AddHostedService<SessionCleanupService>();
 // 서비스 상태 확인용 HealthCheck
 builder.Services.AddControllers();
 
+// Kestrel 설정
+// Kestrel은 .NET의 경량 웹 서버로, .NET 애플리케이션에서 HTTP와 WebSocket 요청을 수신하는 역할을 합니다.
+// 해당 설정은 Kestrel이 처리할 수 있는 최대 연결 수, 업그레이드 연결 수, 요청 본문 크기, Keep-Alive 시간 등을 설정합니다.
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxConcurrentConnections = 10000;
+    options.Limits.MaxConcurrentUpgradedConnections = 5000; // WebSocket
+    options.Limits.MaxRequestBodySize = 10 * 1024;
+    options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(2);
+});
+
 var app = builder.Build();
 
 // 미들웨어 구성
