@@ -13,6 +13,7 @@
   <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" Version="2.80.0"/>
     <PackageReference Include="Grpc.Tools" Version="2.80.0" PrivateAssets="All" />
+    <PackageReference Include="StackExchange.Redis" Version="2.8.16" />
   </ItemGroup>
 
   <ItemGroup>

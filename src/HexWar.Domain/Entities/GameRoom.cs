@@ -1,5 +1,6 @@
 namespace HexWar.Domain.Entities;
 
+using System.Text.Json.Serialization;
 using HexWar.Domain.Commands;
 using HexWar.Domain.Enums;
 using HexWar.Domain.Events;
@@ -8,24 +9,39 @@ using HexWar.Domain.ValueObjects;
 
 public partial class GameRoom
 {
-    public string RoomId { get; }
+    [JsonInclude]
+    public string RoomId { get; private set; }
+
+    [JsonInclude]
     public GamePhase Phase { get; private set; }
+
+    [JsonInclude]
     public int CurrentRound { get; private set; }
-    public int MaxRounds { get; } = 20;
+
+    [JsonInclude]
+    public int MaxRounds { get; private set; } = 20;
 
     // 순차적 접근이 필요하지 않음으로 index 기반의 리스트보다 Dictionary가 더 적합함
-    public Dictionary<NodeId, Node> Nodes { get; } = new();
-    public Dictionary<EdgeId, Edge> Edges { get; } = new();
-    public Dictionary<PlayerSide, PlayerId> Players { get; } = new();
+    [JsonInclude]
+    public Dictionary<NodeId, Node> Nodes { get; private set; } = new();
+
+    [JsonInclude]
+    public Dictionary<EdgeId, Edge> Edges { get; private set; } = new();
+
+    [JsonInclude]
+    public Dictionary<PlayerSide, PlayerId> Players { get; private set; } = new();
 
     // 라운드에 소모한 유닛 수 파악용
-    public Dictionary<PlayerSide, int> UnitUsedThisRound { get; } = new()
+    [JsonInclude]
+    public Dictionary<PlayerSide, int> UnitUsedThisRound { get; private set; } = new()
     {
         { PlayerSide.A, 0 },
         { PlayerSide.B, 0 }
     };
 
     // Planning 단계에서 예약된 이동 명령 (취소 불가)
+    [JsonInclude]
+    [JsonPropertyName("pendingMoves")]
     private Dictionary<PlayerSide, List<PendingMove>> _pendingMoves = new()
     {
         { PlayerSide.A, new List<PendingMove>() },
@@ -38,16 +54,19 @@ public partial class GameRoom
 
 
     // 조우 이벤트 목록
-    public List<PendingEncounter> PendingEncounters { get; } = new();
+    [JsonInclude]
+    public List<PendingEncounter> PendingEncounters { get; private set; } = new();
 
     // 조우 결정 완료 여부
-    public Dictionary<PlayerSide, bool> EncounterDecisionReady { get; } = new()
+    [JsonInclude]
+    public Dictionary<PlayerSide, bool> EncounterDecisionReady { get; private set; } = new()
     {
         { PlayerSide.A, false },
         { PlayerSide.B, false }
     };
 
     // 생성자 함수를 통한 기본 상태 정의
+    [JsonConstructor]
     public GameRoom(string roomId)
     {
         RoomId = roomId;
@@ -275,6 +294,30 @@ public partial class GameRoom
     public IReadOnlyList<PendingMove> GetPendingMoves(PlayerSide side)
     {
         return _pendingMoves[side].AsReadOnly();
+    }
+
+    /// <summary>
+    /// 누적된 도메인 이벤트를 반환하고 내부 리스트를 비웁니다.
+    /// </summary>
+    public IReadOnlyList<IDomainEvent> FlushDomainEvents()
+    {
+        var events = _domainEvents.ToList();
+        ClearDomainEvents();
+        return events;
+    }
+
+    /// <summary>
+    /// 외부 요인(예: 접속 종료)으로 게임을 즉시 종료시킵니다.
+    /// </summary>
+    public void ForceGameOver(PlayerSide? winner, GameOverReason reason)
+    {
+        Phase = GamePhase.GameOver;
+        var scores = new Dictionary<PlayerSide, int>
+        {
+            { PlayerSide.A, Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerA) },
+            { PlayerSide.B, Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerB) }
+        };
+        RaiseEvent(new GameOver(RoomId, winner, reason, CurrentRound, scores));
     }
 }
 

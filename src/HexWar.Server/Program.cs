@@ -1,7 +1,7 @@
 using HexWar.Application.Services;
 using HexWar.Application.Sessions;
-using HexWar.Infrastructure.Persistence;
 using HexWar.Infrastructure.Messaging;
+using HexWar.Infrastructure.Persistence;
 using HexWar.Infrastructure.WebSocket;
 using HexWar.Matchmaking.Services;
 using HexWar.Server.BackgroundServices;
@@ -22,16 +22,17 @@ try
     redis = connection;
     builder.Services.AddSingleton<IConnectionMultiplexer>(connection);
     builder.Services.AddSingleton(redisConfig);
-    
+
     // Redis 기반 서비스
+    builder.Services.AddSingleton<IDistributedLock, RedisDistributedLock>();
     builder.Services.AddSingleton<IGameRoomRepository, RedisGameRoomRepository>();
     builder.Services.AddSingleton<IGameEventPublisher, RedisEventPublisher>();
-    
-    Console.WriteLine("✅ Redis connected - distributed mode");
+
+    Console.WriteLine("Redis connected - distributed mode");
 }
 catch (Exception)
 {
-    Console.WriteLine("⚠️ Redis unavailable - standalone mode");
+    Console.WriteLine("Redis unavailable - standalone mode");
     builder.Services.AddSingleton<IGameRoomRepository, InMemoryGameRoomRepository>();
     // IGameEventPublisher 등록 안 함 → null 허용
 }
@@ -39,7 +40,13 @@ catch (Exception)
 // 공통 서비스 (WebSocket + gRPC에서 공유)
 builder.Services.AddSingleton<ConnectionManager>();
 builder.Services.AddSingleton<SessionRegistry>();
-builder.Services.AddSingleton<MatchmakingQueue>();
+builder.Services.AddSingleton<MatchmakingQueue>(sp =>
+{
+    var redis = sp.GetService<IConnectionMultiplexer>();
+    var distLock = sp.GetService<IDistributedLock>();
+    var repository = sp.GetService<IGameRoomRepository>();
+    return new MatchmakingQueue(redis, distLock, repository);
+});
 
 // 이벤트 브로드캐스터
 // SessionRegistry를 팩토리 실행 시 즉시 참조하면 SessionRegistry ↔ IEventBroadcaster 간
@@ -62,7 +69,14 @@ builder.Services.AddSingleton<IEventBroadcaster>(sp =>
 builder.Services.AddSingleton<GameWebSocketHandler>();
 
 // gRPC 매치메이킹 서비스 (싱글톤 등록하여 OnMatchFound 중복 이벤트 구독 방지)
-builder.Services.AddSingleton<MatchmakingService>();
+builder.Services.AddSingleton<MatchmakingService>(sp =>
+{
+    var queue = sp.GetRequiredService<MatchmakingQueue>();
+    var sessionRegistry = sp.GetRequiredService<SessionRegistry>();
+    var logger = sp.GetRequiredService<ILogger<MatchmakingService>>();
+    var redis = sp.GetService<IConnectionMultiplexer>();
+    return new MatchmakingService(queue, sessionRegistry, logger, redis);
+});
 
 // gRPC 서비스
 builder.Services.AddGrpc();

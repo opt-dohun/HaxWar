@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using System;
 using System.Collections.Concurrent;
 using System.Threading.Tasks;
+using StackExchange.Redis;
 
 namespace HexWar.Server.Controllers;
 
@@ -12,14 +13,15 @@ namespace HexWar.Server.Controllers;
 public class MatchmakingApiController : ControllerBase
 {
     private readonly SessionRegistry _sessionRegistry;
+    private readonly IDatabase? _db;
     
-    // Thread-safe dictionary to pair up load test requests
-    // Key: i (the index of the game, e.g. from the playerId "load-A-0" -> "0")
+    // Thread-safe dictionary for standalone fallback
     private static readonly ConcurrentDictionary<string, string> _waitingRooms = new();
 
-    public MatchmakingApiController(SessionRegistry sessionRegistry)
+    public MatchmakingApiController(SessionRegistry sessionRegistry, StackExchange.Redis.IConnectionMultiplexer? redis = null)
     {
         _sessionRegistry = sessionRegistry;
+        _db = redis?.GetDatabase();
     }
 
     [HttpPost("join")]
@@ -43,10 +45,16 @@ public class MatchmakingApiController : ControllerBase
                 
                 // Create game session
                 var session = await _sessionRegistry.CreateSessionAsync(roomId);
-                var gameRoom = session.GetGameRoom();
-                gameRoom.AddPlayer(new PlayerId(request.PlayerId));
+                await session.AddPlayerAsync(new PlayerId(request.PlayerId));
 
-                _waitingRooms[index] = roomId;
+                if (_db != null)
+                {
+                    await _db.StringSetAsync($"matchmaking:waiting_room:{index}", roomId, TimeSpan.FromSeconds(30));
+                }
+                else
+                {
+                    _waitingRooms[index] = roomId;
+                }
 
                 return Ok(new MatchResponse
                 {
@@ -61,22 +69,41 @@ public class MatchmakingApiController : ControllerBase
                 string? roomId = null;
                 for (int attempt = 0; attempt < 20; attempt++)
                 {
-                    if (_waitingRooms.TryGetValue(index, out roomId))
+                    if (_db != null)
                     {
-                        break;
+                        var redisRoomId = await _db.StringGetAsync($"matchmaking:waiting_room:{index}");
+                        if (redisRoomId.HasValue)
+                        {
+                            roomId = redisRoomId.ToString();
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        if (_waitingRooms.TryGetValue(index, out roomId))
+                        {
+                            break;
+                        }
                     }
                     await Task.Delay(100);
                 }
 
                 if (roomId != null)
                 {
-                    var session = _sessionRegistry.GetSession(roomId);
+                    var session = await _sessionRegistry.GetOrCreateSessionAsync(roomId);
                     if (session != null)
                     {
-                        session.GetGameRoom().AddPlayer(new PlayerId(request.PlayerId));
+                        await session.AddPlayerAsync(new PlayerId(request.PlayerId));
                     }
                     
-                    _waitingRooms.TryRemove(index, out _);
+                    if (_db != null)
+                    {
+                        await _db.KeyDeleteAsync($"matchmaking:waiting_room:{index}");
+                    }
+                    else
+                    {
+                        _waitingRooms.TryRemove(index, out _);
+                    }
 
                     return Ok(new MatchResponse
                     {

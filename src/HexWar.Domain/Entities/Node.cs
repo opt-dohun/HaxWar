@@ -1,32 +1,43 @@
 namespace HexWar.Domain.Entities;
 
+using System.Text.Json.Serialization;
 using HexWar.Domain.Enums;
 using HexWar.Domain.ValueObjects;
 
 public class Node
 {
-    public NodeId Id { get; }
-    public string Name { get; }
-    public NodeType Type { get; } // 전초기지 유형 표현 추가
+    [JsonInclude]
+    public NodeId Id { get; private set; }
+
+    [JsonInclude]
+    public string Name { get; private set; }
+
+    [JsonInclude]
+    public NodeType Type { get; private set; } // 전초기지 유형 표현 추가
     public bool IsHeadquarters => Type == NodeType.Headquarters;
     public bool IsSupplyLine => Type == NodeType.SupplyLine;
 
     // 점유 상태
+    [JsonInclude]
     public NodeOwnership Ownership { get; set; }
 
     // 각 플레이어별 유닛 그룹
-    public Dictionary<PlayerSide, UnitGroup> Units { get; } = new()
+    [JsonInclude]
+    public Dictionary<PlayerSide, UnitGroup> Units { get; private set; } = new()
     {
         { PlayerSide.A , new UnitGroup(PlayerSide.A)  },
         { PlayerSide.B , new UnitGroup(PlayerSide.B) }
     };
 
     // 이웃한 노드 정보 List
-    public List<NodeId> Neighbors { get; } = new();
+    [JsonInclude]
+    public List<NodeId> Neighbors { get; private set; } = new();
 
     // 이번 라운드 출발 정보 (상대방에게 공개될 리스트)
-    public List<DepartureAnnouncement> RecentDepartures { get; } = new();
+    [JsonInclude]
+    public List<DepartureAnnouncement> RecentDepartures { get; private set; } = new();
 
+    [JsonConstructor]
     public Node(NodeId id, string name, NodeType type = NodeType.OutPost)
     {
         Id = id;

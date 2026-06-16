@@ -12,17 +12,20 @@ public class SessionRegistry
     private readonly IGameRoomRepository _repository;
     private readonly IEventBroadcaster _eventBroadcaster;
     private readonly IGameEventPublisher? _eventPublisher;
+    private readonly IDistributedLock? _distributedLock;
     private readonly ILogger<GameSession>? _logger;
 
     public SessionRegistry(
         IGameRoomRepository repository,
         IEventBroadcaster eventBroadcaster,
         IGameEventPublisher? eventPublisher = null,
+        IDistributedLock? distributedLock = null,
         ILogger<GameSession>? logger = null)
     {
         _repository = repository;
         _eventBroadcaster = eventBroadcaster;
         _eventPublisher = eventPublisher;
+        _distributedLock = distributedLock;
         _logger = logger;
     }
 
@@ -34,8 +37,15 @@ public class SessionRegistry
 
         var gameRoom = new GameRoom(roomId);
         gameRoom.InitializeMap();
+        await _repository.SaveAsync(gameRoom);
 
-        var session = new GameSession(gameRoom, _eventBroadcaster, _repository, _eventPublisher, _logger);
+        var session = new GameSession(
+            roomId, 
+            _eventBroadcaster, 
+            _repository, 
+            _eventPublisher, 
+            _distributedLock, 
+            _logger);
 
         // 종료 시 등록할 이벤트 핸들러 - 게임 종료 후 1분 뒤 메모리에서 제거 
         session.OnGameOver += async (s, e) =>
@@ -45,12 +55,42 @@ public class SessionRegistry
         };
 
         _sessions[roomId] = session;
-        await _repository.SaveAsync(gameRoom);
 
         return session;
     }
 
-    // 세션 조회
+    // 세션 조회 또는 Redis로부터 복원 (Hydrate)
+    public async Task<GameSession?> GetOrCreateSessionAsync(string roomId)
+    {
+        if (_sessions.TryGetValue(roomId, out var session))
+        {
+            return session;
+        }
+
+        if (await _repository.ExistsAsync(roomId))
+        {
+            var hydratedSession = new GameSession(
+                roomId, 
+                _eventBroadcaster, 
+                _repository, 
+                _eventPublisher, 
+                _distributedLock, 
+                _logger);
+
+            hydratedSession.OnGameOver += async (s, e) =>
+            {
+                await Task.Delay(TimeSpan.FromMinutes(1));
+                _sessions.TryRemove(roomId, out _);
+            };
+
+            _sessions[roomId] = hydratedSession;
+            return hydratedSession;
+        }
+
+        return null;
+    }
+
+    // 세션 조회 (로컬 전용)
     public GameSession? GetSession(string roomId)
     {
         _sessions.TryGetValue(roomId, out var session);

@@ -1,10 +1,15 @@
 namespace HexWar.Matchmaking.Services;
 
+using System;
 using System.Collections.Concurrent;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Grpc.Core;
 using HexWar.Application.Sessions;
 using HexWar.Matchmaking;
 using Microsoft.Extensions.Logging;
+using StackExchange.Redis;
 
 /// <summary>
 /// gRPC 매치메이킹 서비스 구현체
@@ -14,6 +19,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
     private readonly MatchmakingQueue _queue;
     private readonly SessionRegistry _sessionRegistry;
     private readonly ILogger<MatchmakingService> _logger;
+    private readonly ISubscriber? _sub;
     
     // 매칭 완료된 플레이어에게 결과를 전달하기 위한 채널과 비동기 완료 알림용 TaskCompletionSource
     private readonly ConcurrentDictionary<string, (IServerStreamWriter<MatchmakingUpdate> Stream, TaskCompletionSource<MatchmakingUpdate> Completion)> _waitingPlayers = new();
@@ -21,7 +27,8 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
     public MatchmakingService(
         MatchmakingQueue queue,
         SessionRegistry sessionRegistry,
-        ILogger<MatchmakingService> logger)
+        ILogger<MatchmakingService> logger,
+        IConnectionMultiplexer? redis = null)
     {
         _queue = queue;
         _sessionRegistry = sessionRegistry;
@@ -29,10 +36,69 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
         
         // 매칭 완료 이벤트 구독
         _queue.OnMatchFound += OnMatchFound;
+
+        if (redis != null)
+        {
+            _sub = redis.GetSubscriber();
+            _sub.Subscribe(RedisChannel.Literal("matchmaking:matches"), (channel, message) =>
+            {
+                HandleDistributedMatch(message.ToString());
+            });
+        }
+    }
+
+    private void HandleDistributedMatch(string messageJson)
+    {
+        try
+        {
+            var payload = JsonSerializer.Deserialize<DistributedMatchPayload>(messageJson);
+            if (payload == null) return;
+
+            _logger.LogInformation("Received distributed match event: {RoomId}, Player1={P1}, Player2={P2}", 
+                payload.RoomId, payload.Player1Id, payload.Player2Id);
+
+            var wsEndpoint = $"ws://localhost:5183/ws/game/{payload.RoomId}";
+
+            // Player 1에게 매칭 결과 전송
+            if (_waitingPlayers.TryGetValue(payload.Player1Id, out var state1))
+            {
+                state1.Completion.TrySetResult(new MatchmakingUpdate
+                {
+                    Status = MatchmakingStatus.Matched,
+                    MatchResult = new MatchFoundResult
+                    {
+                        RoomId = payload.RoomId,
+                        PlayerSide = "A",
+                        WsEndpoint = wsEndpoint,
+                        OpponentId = payload.Player2Id
+                    }
+                });
+            }
+
+            // Player 2에게 매칭 결과 전송
+            if (_waitingPlayers.TryGetValue(payload.Player2Id, out var state2))
+            {
+                state2.Completion.TrySetResult(new MatchmakingUpdate
+                {
+                    Status = MatchmakingStatus.Matched,
+                    MatchResult = new MatchFoundResult
+                    {
+                        RoomId = payload.RoomId,
+                        PlayerSide = "B",
+                        WsEndpoint = wsEndpoint,
+                        OpponentId = payload.Player1Id
+                    }
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error handling distributed match message");
+        }
     }
 
     /// <summary>
-    /// 매칭 큐 참가 (서버 스트리밍)
+    /// 큐 참가 (서버 스트리밍)
     /// </summary>
     public override async Task JoinQueue(
         JoinQueueRequest request,
@@ -57,7 +123,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
         _waitingPlayers[playerId] = (responseStream, matchCompletion);
 
         // 큐에 등록
-        var queuedPlayer = _queue.Enqueue(playerId, request.Rating, context.CancellationToken);
+        var queuedPlayer = await _queue.EnqueueAsync(playerId, request.Rating, context.CancellationToken);
 
         try
         {
@@ -69,7 +135,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
                     break;
                 }
 
-                var status = _queue.GetStatus(playerId);
+                var status = await _queue.GetStatusAsync(playerId);
                 
                 if (status.IsInQueue)
                 {
@@ -107,7 +173,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
         catch (OperationCanceledException)
         {
             _logger.LogInformation("Player {PlayerId} cancelled matchmaking", playerId);
-            _queue.Dequeue(playerId);
+            await _queue.DequeueAsync(playerId);
             await responseStream.WriteAsync(new MatchmakingUpdate
             {
                 Status = MatchmakingStatus.Cancelled
@@ -124,7 +190,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
         finally
         {
             _waitingPlayers.TryRemove(playerId, out _);
-            _queue.Dequeue(playerId);
+            await _queue.DequeueAsync(playerId);
         }
     }
 
@@ -139,54 +205,66 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
         {
             // 게임 세션 생성
             var session = await _sessionRegistry.CreateSessionAsync(roomId);
-            var gameRoom = session.GetGameRoom();
             
             // 플레이어 등록
-            gameRoom.AddPlayer(new Domain.ValueObjects.PlayerId(e.Player1.PlayerId));
-            gameRoom.AddPlayer(new Domain.ValueObjects.PlayerId(e.Player2.PlayerId));
+            await session.AddPlayerAsync(new Domain.ValueObjects.PlayerId(e.Player1.PlayerId));
+            await session.AddPlayerAsync(new Domain.ValueObjects.PlayerId(e.Player2.PlayerId));
 
-            _logger.LogInformation("Match found: {RoomId}, Player1={P1}, Player2={P2}", 
+            _logger.LogInformation("Match found and room created: {RoomId}, Player1={P1}, Player2={P2}", 
                 roomId, e.Player1.PlayerId, e.Player2.PlayerId);
 
-            // WebSocket 엔드포인트 (실제 포트인 5183 사용)
-            var wsEndpoint = $"ws://localhost:5183/ws/game/{roomId}";
-
-            // Player 1에게 매칭 결과 전송
-            if (_waitingPlayers.TryGetValue(e.Player1.PlayerId, out var state1))
+            if (_sub != null)
             {
-                state1.Completion.TrySetResult(new MatchmakingUpdate
+                var payload = new DistributedMatchPayload
                 {
-                    Status = MatchmakingStatus.Matched,
-                    MatchResult = new MatchFoundResult
-                    {
-                        RoomId = roomId,
-                        PlayerSide = "A",
-                        WsEndpoint = wsEndpoint,
-                        OpponentId = e.Player2.PlayerId
-                    }
-                });
+                    RoomId = roomId,
+                    Player1Id = e.Player1.PlayerId,
+                    Player2Id = e.Player2.PlayerId
+                };
+                var json = JsonSerializer.Serialize(payload);
+                await _sub.PublishAsync(RedisChannel.Literal("matchmaking:matches"), json);
             }
-
-            // Player 2에게 매칭 결과 전송
-            if (_waitingPlayers.TryGetValue(e.Player2.PlayerId, out var state2))
+            else
             {
-                state2.Completion.TrySetResult(new MatchmakingUpdate
+                // WebSocket 엔드포인트
+                var wsEndpoint = $"ws://localhost:5183/ws/game/{roomId}";
+
+                // Player 1에게 매칭 결과 전송
+                if (_waitingPlayers.TryGetValue(e.Player1.PlayerId, out var state1))
                 {
-                    Status = MatchmakingStatus.Matched,
-                    MatchResult = new MatchFoundResult
+                    state1.Completion.TrySetResult(new MatchmakingUpdate
                     {
-                        RoomId = roomId,
-                        PlayerSide = "B",
-                        WsEndpoint = wsEndpoint,
-                        OpponentId = e.Player1.PlayerId
-                    }
-                });
+                        Status = MatchmakingStatus.Matched,
+                        MatchResult = new MatchFoundResult
+                        {
+                            RoomId = roomId,
+                            PlayerSide = "A",
+                            WsEndpoint = wsEndpoint,
+                            OpponentId = e.Player2.PlayerId
+                        }
+                    });
+                }
+
+                // Player 2에게 매칭 결과 전송
+                if (_waitingPlayers.TryGetValue(e.Player2.PlayerId, out var state2))
+                {
+                    state2.Completion.TrySetResult(new MatchmakingUpdate
+                    {
+                        Status = MatchmakingStatus.Matched,
+                        MatchResult = new MatchFoundResult
+                        {
+                            RoomId = roomId,
+                            PlayerSide = "B",
+                            WsEndpoint = wsEndpoint,
+                            OpponentId = e.Player1.PlayerId
+                        }
+                    });
+                }
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error creating match for room {RoomId}", roomId);
-            // 예외 발생 시 에러 알림 전송하여 클라이언트의 비한정 루프 탈출
             if (_waitingPlayers.TryGetValue(e.Player1.PlayerId, out var state1))
             {
                 state1.Completion.TrySetResult(new MatchmakingUpdate { Status = MatchmakingStatus.Error });
@@ -201,31 +279,38 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
     /// <summary>
     /// 큐에서 나가기
     /// </summary>
-    public override Task<LeaveQueueResponse> LeaveQueue(
+    public override async Task<LeaveQueueResponse> LeaveQueue(
         LeaveQueueRequest request, ServerCallContext context)
     {
-        var removed = _queue.Dequeue(request.PlayerId);
+        var removed = await _queue.DequeueAsync(request.PlayerId);
         
-        return Task.FromResult(new LeaveQueueResponse
+        return new LeaveQueueResponse
         {
             Success = removed
-        });
+        };
     }
 
     /// <summary>
     /// 큐 상태 확인
     /// </summary>
-    public override Task<QueueStatus> GetQueueStatus(
+    public override async Task<QueueStatus> GetQueueStatus(
         GetQueueStatusRequest request, ServerCallContext context)
     {
-        var status = _queue.GetStatus(request.PlayerId);
+        var status = await _queue.GetStatusAsync(request.PlayerId);
         
-        return Task.FromResult(new QueueStatus
+        return new QueueStatus
         {
             IsInQueue = status.IsInQueue,
             QueuePosition = status.Position,
             EstimatedWaitSeconds = status.EstimatedWaitSeconds,
             PlayersInQueue = status.TotalInQueue
-        });
+        };
     }
+}
+
+public class DistributedMatchPayload
+{
+    public string RoomId { get; set; } = string.Empty;
+    public string Player1Id { get; set; } = string.Empty;
+    public string Player2Id { get; set; } = string.Empty;
 }

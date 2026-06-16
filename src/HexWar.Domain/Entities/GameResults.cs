@@ -3,6 +3,7 @@ namespace HexWar.Domain.Entities;
 using HexWar.Domain.Enums;
 using HexWar.Domain.Events;
 using HexWar.Domain.ValueObjects;
+using System.Text.Json.Serialization;
 
 public record MoveResult(int ActualMoved, NodeId From, NodeId To);
 
@@ -17,20 +18,36 @@ public class RoundResolutionResult
     public PlayerSide? Winner { get; set; }
 }
 
+
 public class PendingEncounter
 {
-    public EdgeId EdgeId { get; }
-    public TravelingGroup GroupA { get; }
-    public TravelingGroup GroupB { get; }
-    public int RemainingRounds { get; }
+    [JsonInclude]
+    public EdgeId EdgeId { get; private set; }
 
+    [JsonInclude]
+    public TravelingGroup GroupA { get; private set; }
+
+    [JsonInclude]
+    public TravelingGroup GroupB { get; private set; }
+
+    [JsonInclude]
+    public int RemainingRounds { get; private set; }
+
+    [JsonInclude]
     public EncounterDecision? DecisionA { get; private set; }
+
+    [JsonInclude]
     public EncounterDecision? DecisionB { get; private set; }
+
+    [JsonInclude]
     public EncounterOutcome? OutcomeA { get; private set; }
+
+    [JsonInclude]
     public EncounterOutcome? OutcomeB { get; private set; }
 
     public bool BothDecided => DecisionA.HasValue && DecisionB.HasValue;
 
+    [JsonConstructor]
     public PendingEncounter(EdgeId edgeId, TravelingGroup groupA, TravelingGroup groupB, int remainingRounds)
     {
         EdgeId = edgeId;

@@ -37,7 +37,7 @@ public class GameWebSocketHandler
         // 연결 등록
         _connectionManager.AddConnection(roomId, playerSide, webSocket);
 
-        var session = _sessionRegistry.GetSession(roomId);
+        var session = await _sessionRegistry.GetOrCreateSessionAsync(roomId);
         if (session == null)
         {
             await SendErrorAsync(webSocket, "Session not found");
@@ -297,7 +297,7 @@ public class GameWebSocketHandler
         GameSession session,
         PlayerSide side)
     {
-        var stateView = session.GetGameStateForPlayer(side);
+        var stateView = await session.GetGameStateForPlayerAsync(side);
 
         var serverMessage = new ServerMessage
         {
@@ -319,7 +319,7 @@ public class GameWebSocketHandler
             var socket = _connectionManager.GetConnection(session.RoomId, side.ToString());
             if (socket != null && socket.State == WebSocketState.Open)
             {
-                var stateView = session.GetGameStateForPlayer(side);
+                var stateView = await session.GetGameStateForPlayerAsync(side);
                 var serverMessage = new ServerMessage
                 {
                     Type = ServerMessageTypes.StateUpdate,
@@ -407,7 +407,7 @@ public class GameWebSocketHandler
         }
 
         // 현재 상태도 전송
-        var stateView = session.GetGameStateForPlayer(side);
+        var stateView = await session.GetGameStateForPlayerAsync(side);
         var stateMessage = new ServerMessage
         {
             Type = "state_update",

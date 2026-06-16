@@ -1,18 +1,42 @@
 namespace HexWar.Matchmaking.Services;
 
+using System;
 using System.Collections.Concurrent;
-using Grpc.Core;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using HexWar.Application.Services;
+using HexWar.Domain.Entities;
+using HexWar.Domain.ValueObjects;
+using StackExchange.Redis;
 
 public class MatchmakingQueue
 {
-    // 참조형 자료형을 readonly로 사용할 경우 객체 자체는 불변하지만, 내부 필드는 변경 가능하기 때문에 
-    private readonly ConcurrentQueue<QueuedPlayer> _queue = new();
+    private readonly IConnectionMultiplexer? _redis;
+    private readonly IDistributedLock? _distributedLock;
+    private readonly IGameRoomRepository? _repository;
+
+    // Standalone fallback
+    private readonly ConcurrentQueue<QueuedPlayer> _inMemoryQueue = new();
     private readonly object _matchLock = new();
 
     // 매칭 이벤트 핸들러
-    public event EventHandler<MatchFoundEventArgs> OnMatchFound;
+    public event EventHandler<MatchFoundEventArgs>? OnMatchFound;
 
-    public QueuedPlayer Enqueue(string playerId, int rating, CancellationToken cancellationToken)
+    public MatchmakingQueue(
+        IConnectionMultiplexer? redis = null,
+        IDistributedLock? distributedLock = null,
+        IGameRoomRepository? repository = null)
+    {
+        _redis = redis;
+        _distributedLock = distributedLock;
+        _repository = repository;
+    }
+
+    public async Task<QueuedPlayer> EnqueueAsync(string playerId, int rating, CancellationToken cancellationToken)
     {
         var player = new QueuedPlayer
         {
@@ -22,74 +46,219 @@ public class MatchmakingQueue
             CancellationToken = cancellationToken
         };
 
-        _queue.Enqueue(player);
+        if (_redis != null)
+        {
+            var db = _redis.GetDatabase();
 
-        TryMatch();
+            var dto = new QueuedPlayerDto
+            {
+                PlayerId = player.PlayerId,
+                Rating = player.Rating,
+                JoinedAt = player.JoinedAt
+            };
+            var json = JsonSerializer.Serialize(dto);
+
+            // Store player details in Redis hash
+            await db.HashSetAsync("matchmaking:player_details", playerId, json);
+
+            // Push to Redis queue (remove duplicate first if any)
+            await db.ListRemoveAsync("matchmaking:queue", playerId);
+            await db.ListRightPushAsync("matchmaking:queue", playerId);
+
+            // Trigger matching asynchronously
+            _ = Task.Run(async () => await TryMatchAsync());
+        }
+        else
+        {
+            _inMemoryQueue.Enqueue(player);
+            TryMatchInMemory();
+        }
 
         return player;
     }
 
-    public bool Dequeue(string playerId)
+    public async Task<bool> DequeueAsync(string playerId)
     {
-        // 삭제 대상 유저를 제외한 리스트 생성
-        var remaining = _queue.Where(p => p.PlayerId != playerId).ToList();
-
-        while (_queue.TryDequeue(out _)) { } // 기존 큐 비우기
-
-        foreach (var player in remaining)
+        if (_redis != null)
         {
-            _queue.Enqueue(player);
+            var db = _redis.GetDatabase();
+            await db.HashDeleteAsync("matchmaking:player_details", playerId);
+            var removed = await db.ListRemoveAsync("matchmaking:queue", playerId);
+            return removed > 0;
         }
+        else
+        {
+            // Standalone Dequeue
+            var remaining = _inMemoryQueue.Where(p => p.PlayerId != playerId).ToList();
 
-        return remaining.Count < _queue.Count + 1; // 하나 제거되었는지 확인
+            while (_inMemoryQueue.TryDequeue(out _)) { }
+
+            foreach (var player in remaining)
+            {
+                _inMemoryQueue.Enqueue(player);
+            }
+
+            return remaining.Count < _inMemoryQueue.Count + 1;
+        }
     }
 
-    private void TryMatch()
+    private async Task TryMatchAsync()
+    {
+        if (_redis == null || _distributedLock == null || _repository == null)
+            return;
+
+        // Acquire distributed lock for matching process
+        using var lockHandle = await _distributedLock.TryAcquireAsync("matchmaking:queue", TimeSpan.FromSeconds(5));
+        if (lockHandle == null)
+        {
+            return; // Busy, another server is matching
+        }
+
+        var db = _redis.GetDatabase();
+        var queueLength = await db.ListLengthAsync("matchmaking:queue");
+        if (queueLength < 2)
+            return;
+
+        // Pop two players
+        var p1Val = await db.ListLeftPopAsync("matchmaking:queue");
+        var p2Val = await db.ListLeftPopAsync("matchmaking:queue");
+
+        if (p1Val.IsNullOrEmpty || p2Val.IsNullOrEmpty)
+        {
+            // Re-enqueue if we only got one
+            if (!p1Val.IsNullOrEmpty) await db.ListLeftPushAsync("matchmaking:queue", p1Val);
+            if (!p2Val.IsNullOrEmpty) await db.ListLeftPushAsync("matchmaking:queue", p2Val);
+            return;
+        }
+
+        var p1Id = p1Val.ToString();
+        var p2Id = p2Val.ToString();
+
+        var p1Json = await db.HashGetAsync("matchmaking:player_details", p1Id);
+        var p2Json = await db.HashGetAsync("matchmaking:player_details", p2Id);
+
+        if (p1Json.IsNullOrEmpty || p2Json.IsNullOrEmpty)
+        {
+            // Stale cleanup
+            if (!p1Json.IsNullOrEmpty)
+            {
+                await db.ListLeftPushAsync("matchmaking:queue", p1Val);
+            }
+            else
+            {
+                await db.HashDeleteAsync("matchmaking:player_details", p1Id);
+            }
+
+            if (!p2Json.IsNullOrEmpty)
+            {
+                await db.ListLeftPushAsync("matchmaking:queue", p2Val);
+            }
+            else
+            {
+                await db.HashDeleteAsync("matchmaking:player_details", p2Id);
+            }
+
+            // Retry matching
+            _ = Task.Run(async () => await TryMatchAsync());
+            return;
+        }
+
+        await db.HashDeleteAsync("matchmaking:player_details", p1Id);
+        await db.HashDeleteAsync("matchmaking:player_details", p2Id);
+
+        var p1Dto = JsonSerializer.Deserialize<QueuedPlayerDto>(p1Json.ToString());
+        var p2Dto = JsonSerializer.Deserialize<QueuedPlayerDto>(p2Json.ToString());
+
+        if (p1Dto != null && p2Dto != null)
+        {
+            var player1 = new QueuedPlayer
+            {
+                PlayerId = p1Dto.PlayerId,
+                Rating = p1Dto.Rating,
+                JoinedAt = p1Dto.JoinedAt,
+                CancellationToken = CancellationToken.None
+            };
+            var player2 = new QueuedPlayer
+            {
+                PlayerId = p2Dto.PlayerId,
+                Rating = p2Dto.Rating,
+                JoinedAt = p2Dto.JoinedAt,
+                CancellationToken = CancellationToken.None
+            };
+
+            OnMatchFound?.Invoke(this, new MatchFoundEventArgs(player1, player2));
+        }
+
+        // Recursively try to match remaining
+        _ = Task.Run(async () => await TryMatchAsync());
+    }
+
+    private void TryMatchInMemory()
     {
         lock (_matchLock)
         {
-            if (_queue.Count < 2) return;
+            if (_inMemoryQueue.Count < 2) return;
 
-            // 두 명 꺼내기
-            if (_queue.TryDequeue(out var player1) && _queue.TryDequeue(out var player2))
+            if (_inMemoryQueue.TryDequeue(out var player1) && _inMemoryQueue.TryDequeue(out var player2))
             {
-                // 취소된 플레이어 건너뛰기
                 if (player1.CancellationToken.IsCancellationRequested)
                 {
                     if (!player2.CancellationToken.IsCancellationRequested)
-                        _queue.Enqueue(player2);
-                    TryMatch(); // 재시도
+                        _inMemoryQueue.Enqueue(player2);
+                    TryMatchInMemory();
                     return;
                 }
 
                 if (player2.CancellationToken.IsCancellationRequested)
                 {
-                    _queue.Enqueue(player1);
-                    TryMatch(); // 재시도
+                    _inMemoryQueue.Enqueue(player1);
+                    TryMatchInMemory();
                     return;
                 }
 
-                // 매칭 성공
                 OnMatchFound?.Invoke(this, new MatchFoundEventArgs(player1, player2));
             }
         }
     }
 
-    // 현재 대기열 내에 상대적 정보 추출
-    public QueueStatusInfo GetStatus(string playerId)
+    public async Task<QueueStatusInfo> GetStatusAsync(string playerId)
     {
-        var players = _queue.ToList();
-        var player = players.FirstOrDefault(p => p.PlayerId == playerId);
-
-        return new QueueStatusInfo
+        if (_redis != null)
         {
-            IsInQueue = player != null,
-            Position = player != null ? players.IndexOf(player) + 1 : 0,
-            TotalInQueue = players.Count,
-            EstimatedWaitSeconds = players.Count * 5 // 1인당 5초 예상
-        };
-    }
+            var db = _redis.GetDatabase();
+            var players = await db.ListRangeAsync("matchmaking:queue");
+            var playerList = players.Select(p => p.ToString()).ToList();
+            var index = playerList.IndexOf(playerId);
 
+            return new QueueStatusInfo
+            {
+                IsInQueue = index >= 0,
+                Position = index >= 0 ? index + 1 : 0,
+                TotalInQueue = playerList.Count,
+                EstimatedWaitSeconds = playerList.Count * 5
+            };
+        }
+        else
+        {
+            var players = _inMemoryQueue.ToList();
+            var player = players.FirstOrDefault(p => p.PlayerId == playerId);
+
+            return new QueueStatusInfo
+            {
+                IsInQueue = player != null,
+                Position = player != null ? players.IndexOf(player) + 1 : 0,
+                TotalInQueue = players.Count,
+                EstimatedWaitSeconds = players.Count * 5
+            };
+        }
+    }
+}
+
+public class QueuedPlayerDto
+{
+    public string PlayerId { get; set; } = string.Empty;
+    public int Rating { get; set; }
+    public DateTime JoinedAt { get; set; }
 }
 
 public class QueuedPlayer
@@ -97,6 +266,8 @@ public class QueuedPlayer
     public string PlayerId { get; init; } = string.Empty;
     public int Rating { get; init; }
     public DateTime JoinedAt { get; init; }
+    
+    [JsonIgnore]
     public CancellationToken CancellationToken { get; init; }
 }
 

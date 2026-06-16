@@ -4,7 +4,12 @@
 
 namespace HexWar.Application.Sessions;
 
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using HexWar.Application.Commands;
 using HexWar.Application.Messaging;
@@ -25,55 +30,64 @@ using Timer = System.Timers.Timer;
 /// </summary>
 public class GameSession : IDisposable
 {
-    private readonly GameRoom _gameRoom;
-    private readonly IEventBroadcaster _eventBroadcaster;
+    private readonly string _roomId;
     private readonly IGameRoomRepository _repository;
+    private readonly IDistributedLock? _distributedLock;
+    private readonly IEventBroadcaster _eventBroadcaster;
     private readonly IGameEventPublisher? _eventPublisher;
     private readonly ILogger<GameSession>? _logger;
+
+    // 세션 메타데이터만 유지 (GameRoom 상태 아님)
+    private GamePhase _currentPhase = GamePhase.WatingForPlayers;
+    private int _currentRound = 0;
+    private int _maxRounds = 20;
+    private Dictionary<PlayerSide, PlayerId> _players = new();
+
+    // 플레이어 세션 상태 (연결, Planning 완료 여부 등)
     private readonly Dictionary<PlayerSide, PlayerSessionState> _playerStates;
+
+    // 이벤트 버퍼 (재연결용)
+    private readonly CircularBuffer<BufferedEvent> _eventBuffer = new(200);
+    private long _eventSequence = 0;
+
+    // Planning 타이머
     private Timer? _planningTimer;
     private readonly TimeSpan _planningTimeout;
-    private const int DefaultPlanningTimeoutSeconds = 30;
+    private int _planningTimerRound = -1;
 
-    // 플레이어 별 개별락 도입 고려 [TODO]
+    // 동시성 제어 (단일 서버 모드용)
     private readonly SemaphoreSlim _lock = new(1, 1);
 
-    public string RoomId => _gameRoom.RoomId;
-    public GamePhase CurrentPhase => _gameRoom.Phase;
-    public int CurrentRound => _gameRoom.CurrentRound;
+    public string RoomId => _roomId;
+    public GamePhase CurrentPhase => _currentPhase;
+    public int CurrentRound => _currentRound;
+    public int ConnectedPlayerCount => _playerStates.Values.Count(s => s.IsConnected);
 
     public event EventHandler<GameOverEventArgs>? OnGameOver;
     public event EventHandler<RoundResolvedEventArgs>? OnRoundResolved;
 
-    public GameRoom GetGameRoom() => _gameRoom;
-
-    // 동일한 프로젝트 내에서만 접근을 허용하기위한 키워드
     public DateTime? LastActivityAt { get; private set; }
 
     public TimeSpan LastActivityElapsed => LastActivityAt.HasValue
         ? DateTime.UtcNow - LastActivityAt.Value
         : TimeSpan.Zero;
 
-    public int ConnectedPlayerCount => _playerStates.Values.Count(p => p.IsConnected);
-
-    // 이벤트 버퍼 [ 재연결 시 시퀀스 번호에 따라 보정 처리 ]
-    private readonly CircularBuffer<BufferedEvent> _eventBuffer = new(200);
-    private long _eventSequence = 0;
-
     public GameSession(
-        GameRoom gameRoom,
+        string roomId,
         IEventBroadcaster eventBroadcaster,
         IGameRoomRepository repository,
         IGameEventPublisher? eventPublisher = null,
+        IDistributedLock? distributedLock = null,
         ILogger<GameSession>? logger = null,
         TimeSpan? planningTimeout = null)
     {
-        _gameRoom = gameRoom ?? throw new ArgumentNullException(nameof(gameRoom));
-        _eventBroadcaster = eventBroadcaster ?? throw new ArgumentNullException(nameof(eventBroadcaster));
-        _repository = repository ?? throw new ArgumentNullException(nameof(repository));
+        _roomId = roomId;
+        _eventBroadcaster = eventBroadcaster;
+        _repository = repository;
         _eventPublisher = eventPublisher;
+        _distributedLock = distributedLock;
         _logger = logger;
-        _planningTimeout = planningTimeout ?? TimeSpan.FromSeconds(DefaultPlanningTimeoutSeconds);
+        _planningTimeout = planningTimeout ?? TimeSpan.FromSeconds(30);
 
         _playerStates = new()
         {
@@ -83,204 +97,290 @@ public class GameSession : IDisposable
 
         LastActivityAt = DateTime.UtcNow;
 
-        // Redis Pub/Sub 구독 설정 (분산 환경용)
+        // Redis Pub/Sub 구독 (분산 환경)
         if (_eventPublisher != null)
         {
-            _eventPublisher.Subscribe(gameRoom.RoomId, HandleRemoteEventAsync);
+            _eventPublisher.Subscribe(roomId, HandleRemoteEventAsync);
         }
     }
 
-    // 연결 관리
-    public async Task OnPlayerConnectedAsync(PlayerSide side)
-    {
-        await _lock.WaitAsync();
-        try
-        {
-            _playerStates[side].IsConnected = true;
-            _playerStates[side].MarkActivity();
-            LastActivityAt = DateTime.UtcNow;
+    // ============================================================
+    // 핵심: GameRoom이 필요할 때만 Redis에서 로드
+    // ============================================================
 
-            // 첫 번째 라운드이고 계획 단계일 때 양쪽 플레이어가 모두 연결되면 계획 타이머 시작
-            if (_gameRoom.Phase == GamePhase.Planning && _planningTimer == null)
+    /// <summary>
+    /// GameRoom에 대한 독점 접근을 획득하고 작업을 실행합니다.
+    /// 분산 환경: Redis 분산 락 + Redis에서 로드
+    /// 단일 서버: 인메모리 락 + Redis/인메모리에서 로드
+    /// </summary>
+    private async Task<T?> ExecuteOnGameRoomAsync<T>(
+        Func<GameRoom, Task<T>> action) where T : class
+    {
+        if (_distributedLock != null)
+        {
+            // ============================================================
+            // 분산 모드: Redis 락 + Redis에서 GameRoom 로드
+            // ============================================================
+            using var lockHandle = await _distributedLock.TryAcquireAsync(
+                $"gameroom:{_roomId}", TimeSpan.FromSeconds(5));
+
+            if (lockHandle == null)
             {
-                if (_playerStates.Values.All(p => p.IsConnected))
-                {
-                    StartPlanningTimer();
-                }
+                _logger?.LogWarning("Lock contention for room {RoomId}: Busy", _roomId);
+                return null; // 락 획득 실패
             }
 
-            await _repository.SaveAsync(_gameRoom);
-        }
-        finally
-        {
-            _lock.Release();
-        }
-    }
-
-    public async Task OnPlayerDisconnectedAsync(PlayerSide side)
-    {
-        await _lock.WaitAsync();
-        try
-        {
-            _playerStates[side].IsConnected = false;
-            _playerStates[side].MarkActivity();
-            LastActivityAt = DateTime.UtcNow;
-
-            // 15초 유예 후에도 연결이 끊겨있으면 게임 종료
-            _ = Task.Run(async () =>
+            // Redis에서 최신 GameRoom 로드
+            var gameRoom = await _repository.GetByIdAsync(_roomId);
+            if (gameRoom == null)
             {
-                await Task.Delay(TimeSpan.FromSeconds(15));
-                if (!_playerStates[side].IsConnected && _gameRoom.Phase != GamePhase.GameOver)
-                {
-                    await ForceGameOverAsync(GameOverReason.PlayerDisconnected);
-                }
-            });
+                _logger?.LogError("GameRoom {RoomId} not found in repository", _roomId);
+                return null;
+            }
+
+            // 메타데이터 동기화
+            SyncMetadata(gameRoom);
+
+            // 작업 실행
+            var result = await action(gameRoom);
+
+            // 변경된 GameRoom을 Redis에 저장
+            await _repository.SaveAsync(gameRoom);
+
+            // 메타데이터 다시 동기화
+            SyncMetadata(gameRoom);
+
+            return result;
         }
-        finally
+        else
         {
-            _lock.Release();
+            // ============================================================
+            // 단일 서버 모드: 인메모리 락 + 인메모리/Redis에서 로드
+            // ============================================================
+            await _lock.WaitAsync();
+            try
+            {
+                var gameRoom = await _repository.GetByIdAsync(_roomId);
+                if (gameRoom == null)
+                {
+                    return null;
+                }
+
+                SyncMetadata(gameRoom);
+
+                var result = await action(gameRoom);
+
+                await _repository.SaveAsync(gameRoom);
+                SyncMetadata(gameRoom);
+
+                return result;
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
     }
 
-    // 명령 처리
-    public async Task<MoveUnitsCommandResult> HandleMoveUnitsAsync(PlayerSide side, MoveCommand command)
+    /// <summary>
+    /// GameRoom 상태 → GameSession 메타데이터 동기화
+    /// GameSession은 GameRoom을 소유하지 않고, 메타데이터만 캐시합니다.
+    /// </summary>
+    private void SyncMetadata(GameRoom gameRoom)
     {
-        await _lock.WaitAsync();
-        try
+        _currentPhase = gameRoom.Phase;
+        _currentRound = gameRoom.CurrentRound;
+        _maxRounds = gameRoom.MaxRounds;
+        _players = new Dictionary<PlayerSide, PlayerId>(gameRoom.Players);
+    }
+
+    /// <summary>
+    /// 플레이어를 게임방에 참가시킵니다.
+    /// </summary>
+    public async Task<string?> AddPlayerAsync(PlayerId playerId)
+    {
+        return await ExecuteOnGameRoomAsync(async gameRoom =>
         {
-            LastActivityAt = DateTime.UtcNow;
-            // 1차: 연결 확인
-            if (!_playerStates[side].IsConnected)
-                return MoveUnitsCommandResult.Fail("Not connected", "NOT_CONNECTED");
+            var side = gameRoom.AddPlayer(playerId);
+            await PublishAndBroadcastEventsAsync(gameRoom);
+            return side.ToString();
+        });
+    }
 
-            // 2차: 페이즈 확인
-            if (_gameRoom.Phase != GamePhase.Planning)
-                return MoveUnitsCommandResult.Fail("Wrong phase", "WRONG_PHASE");
+    public async Task OnPlayerConnectedAsync(PlayerSide side)
+    {
+        _playerStates[side].IsConnected = true;
+        _playerStates[side].MarkActivity();
+        LastActivityAt = DateTime.UtcNow;
 
-            // 3차: 유닛 수 확인
-            int remaining = _gameRoom.GetRemainingUnits(side);
+        await ExecuteOnGameRoomAsync(gameRoom =>
+        {
+            // 계획 단계일 때 타이머가 구동 중이지 않다면 타이머 시작
+            if (gameRoom.Phase == GamePhase.Planning && _planningTimer == null)
+            {
+                StartPlanningTimer(gameRoom.CurrentRound);
+            }
+            return Task.FromResult("");
+        });
+    }
+
+    public Task OnPlayerDisconnectedAsync(PlayerSide side)
+    {
+        _playerStates[side].IsConnected = false;
+        _playerStates[side].MarkActivity();
+        LastActivityAt = DateTime.UtcNow;
+
+        // 15초 유예 후에도 연결이 끊겨있으면 게임 종료
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+            if (!_playerStates[side].IsConnected && _currentPhase != GamePhase.GameOver)
+            {
+                await ForceGameOverAsync(GameOverReason.PlayerDisconnected);
+            }
+        });
+
+        return Task.CompletedTask;
+    }
+
+    // ============================================================
+    // 명령 처리
+    // ============================================================
+
+    public async Task<MoveUnitsCommandResult> HandleMoveUnitsAsync(
+        PlayerSide side, MoveCommand command)
+    {
+        if (!_playerStates[side].IsConnected)
+            return MoveUnitsCommandResult.Fail("Not connected", "NOT_CONNECTED");
+
+        var result = await ExecuteOnGameRoomAsync(async gameRoom =>
+        {
+            if (gameRoom.Phase != GamePhase.Planning)
+                throw new DomainException("Wrong phase");
+
+            int remaining = gameRoom.GetRemainingUnits(side);
             if (remaining <= 0)
-                return MoveUnitsCommandResult.Fail("No units remaining", "NO_UNITS");
+                throw new DomainException("No units remaining");
 
-            // 요청 수 조정
             int adjustedCount = Math.Min(command.UnitCount, remaining);
             var adjustedCommand = new MoveCommand(command.From, command.To, adjustedCount);
 
-            // 4차: 도메인 실행
-            var moveResult = _gameRoom.MoveUnits(side, adjustedCommand);
+            var moveResult = gameRoom.MoveUnits(side, adjustedCommand);
 
-            // 상태 업데이트
-            _playerStates[side].MoveCommandCompleted = IsMoveCommandCompleted(side);
+            // 세션 상태 업데이트
+            _playerStates[side].MoveCommandCompleted = gameRoom.GetRemainingUnits(side) <= 0;
 
-            // 이벤트 브로드캐스트
-            await BroadcastEventsAsync();
-
-            // 해소 체크
-            await CheckAndResolveIfReadyAsync();
-            await _repository.SaveAsync(_gameRoom);
+            await PublishAndBroadcastEventsAsync(gameRoom);
 
             return MoveUnitsCommandResult.Success(
                 moveResult.ActualMoved,
                 moveResult.From.ToString(),
                 moveResult.To.ToString());
-        }
-        catch (DomainException ex)
+        });
+
+        if (result == null)
         {
-            return MoveUnitsCommandResult.Fail(ex.Message, "DOMAIN_ERROR");
+            return MoveUnitsCommandResult.Fail("Server busy, please retry", "LOCK_CONTENTION");
         }
-        finally
-        {
-            _lock.Release();
-        }
+
+        // 해소 체크
+        await CheckAndResolveIfReadyAsync();
+
+        return result;
     }
 
     public async Task<EncounterDecisionCommandResult> HandleEncounterDecisionAsync(
         PlayerSide side, EdgeId edgeId, EncounterDecision decision)
     {
-        await _lock.WaitAsync();
-        try
-        {
-            LastActivityAt = DateTime.UtcNow;
-            if (!_playerStates[side].IsConnected)
-                return EncounterDecisionCommandResult.Fail("Not connected", "NOT_CONNECTED");
+        if (!_playerStates[side].IsConnected)
+            return EncounterDecisionCommandResult.Fail("Not connected", "NOT_CONNECTED");
 
-            _gameRoom.ResolveEncounter(edgeId, side, decision);
+        var result = await ExecuteOnGameRoomAsync(async gameRoom =>
+        {
+            gameRoom.ResolveEncounter(edgeId, side, decision);
 
             _playerStates[side].EncounterDecisionsCompleted =
-                !_gameRoom.GetUndecidedEncounters(side).Any();
+                !gameRoom.GetUndecidedEncounters(side).Any();
 
-            await BroadcastEventsAsync();
-            await CheckAndResolveIfReadyAsync();
-            await _repository.SaveAsync(_gameRoom);
+            await PublishAndBroadcastEventsAsync(gameRoom);
 
             return EncounterDecisionCommandResult.Success(
                 edgeId.ToString(),
                 decision.ToString(),
-                !_gameRoom.HasPendingEncounterOn(edgeId));
-        }
-        catch (DomainException ex)
+                !gameRoom.HasPendingEncounterOn(edgeId));
+        });
+
+        if (result == null)
         {
-            return EncounterDecisionCommandResult.Fail(ex.Message, "DOMAIN_ERROR");
+            return EncounterDecisionCommandResult.Fail("Server busy, please retry", "LOCK_CONTENTION");
         }
-        finally
-        {
-            _lock.Release();
-        }
+
+        await CheckAndResolveIfReadyAsync();
+
+        return result;
     }
 
+    // ============================================================
     // 게임 상태 조회
-    public GameStateView GetGameStateForPlayer(PlayerSide side)
+    // ============================================================
+
+    public async Task<GameStateView?> GetGameStateForPlayerAsync(PlayerSide side)
     {
-        var enemySide = side == PlayerSide.A ? PlayerSide.B : PlayerSide.A;
-        bool hasHQVision = HasHeadquartersVision(side);
-
-        return new GameStateView
+        return await ExecuteOnGameRoomAsync(gameRoom =>
         {
-            RoomId = RoomId,
-            Phase = _gameRoom.Phase.ToString(),
-            CurrentRound = _gameRoom.CurrentRound,
-            MaxRounds = _gameRoom.MaxRounds,
-            MySide = side.ToString(),
+            var enemySide = side == PlayerSide.A ? PlayerSide.B : PlayerSide.A;
+            bool hasHQVision = HasHeadquartersVision(side, gameRoom);
 
-            // Planning 상태
-            MyRemainingUnits = _gameRoom.GetRemainingUnits(side),
-            MyPendingMoves = _gameRoom.GetPendingMoves(side)
-                .Select(m => new PendingMoveView
-                {
-                    FromNodeId = m.From.Value,
-                    ToNodeId = m.To.Value,
-                    UnitCount = m.Count
-                }).ToList(),
-            MoveCommandCompleted = IsMoveCommandCompleted(side),
-            EncounterDecisionsCompleted = _playerStates[side].EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(side).Any(),
-            IsMyPlanningComplete = IsMoveCommandCompleted(side) && (_playerStates[side].EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(side).Any()),
-
-            // 노드
-            Nodes = _gameRoom.Nodes.Values.Select(node =>
-                BuildNodeView(node, side, enemySide, hasHQVision)).ToList(),
-
-            // 간선
-            Edges = _gameRoom.Edges.Values.Select(edge =>
-                BuildEdgeView(edge, side, enemySide)).ToList(),
-
-            // 조우
-            PendingEncounters = _gameRoom.PendingEncounters.Select(pending =>
-                BuildPendingEncounterView(pending, side, enemySide)).ToList(),
-
-            // 미결정 조우
-            UndecidedEncounterEdgeIds = _gameRoom.GetUndecidedEncounters(side)
-                .Select(e => e.EdgeId.ToString())
-                .ToList(),
-
-            // 게임 종료
-            IsGameOver = _gameRoom.Phase == GamePhase.GameOver,
-            Winner = BuildWinnerString(),
-            Scores = new Dictionary<string, int>
+            var view = new GameStateView
             {
-                { PlayerSide.A.ToString(), _gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerA) },
-                { PlayerSide.B.ToString(), _gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerB) }
-            }
-        };
+                RoomId = RoomId,
+                Phase = gameRoom.Phase.ToString(),
+                CurrentRound = gameRoom.CurrentRound,
+                MaxRounds = gameRoom.MaxRounds,
+                MySide = side.ToString(),
+
+                // Planning 상태
+                MyRemainingUnits = gameRoom.GetRemainingUnits(side),
+                MyPendingMoves = gameRoom.GetPendingMoves(side)
+                    .Select(m => new PendingMoveView
+                    {
+                        FromNodeId = m.From.Value,
+                        ToNodeId = m.To.Value,
+                        UnitCount = m.Count
+                    }).ToList(),
+                MoveCommandCompleted = IsMoveCommandCompleted(side, gameRoom),
+                EncounterDecisionsCompleted = _playerStates[side].EncounterDecisionsCompleted || !gameRoom.GetUndecidedEncounters(side).Any(),
+                IsMyPlanningComplete = IsMoveCommandCompleted(side, gameRoom) && (_playerStates[side].EncounterDecisionsCompleted || !gameRoom.GetUndecidedEncounters(side).Any()),
+
+                // 노드
+                Nodes = gameRoom.Nodes.Values.Select(node =>
+                    BuildNodeView(node, side, enemySide, hasHQVision)).ToList(),
+
+                // 간선
+                Edges = gameRoom.Edges.Values.Select(edge =>
+                    BuildEdgeView(edge, side, enemySide)).ToList(),
+
+                // 조우
+                PendingEncounters = gameRoom.PendingEncounters.Select(pending =>
+                    BuildPendingEncounterView(pending, side, enemySide, gameRoom)).ToList(),
+
+                // 미결정 조우
+                UndecidedEncounterEdgeIds = gameRoom.GetUndecidedEncounters(side)
+                    .Select(e => e.EdgeId.ToString())
+                    .ToList(),
+
+                // 게임 종료
+                IsGameOver = gameRoom.Phase == GamePhase.GameOver,
+                Winner = BuildWinnerString(gameRoom),
+                Scores = new Dictionary<string, int>
+                {
+                    { PlayerSide.A.ToString(), gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerA) },
+                    { PlayerSide.B.ToString(), gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerB) }
+                }
+            };
+
+            return Task.FromResult(view);
+        });
     }
 
     // View 빌더 헬퍼
@@ -357,7 +457,7 @@ public class GameSession : IDisposable
     }
 
     private PendingEncounterDetailView BuildPendingEncounterView(
-        PendingEncounter pending, PlayerSide side, PlayerSide enemySide)
+        PendingEncounter pending, PlayerSide side, PlayerSide enemySide, GameRoom gameRoom)
     {
         var myGroup = pending.GroupA.Side == side ? pending.GroupA : pending.GroupB;
         var enemyGroup = pending.GroupA.Side == side ? pending.GroupB : pending.GroupA;
@@ -365,8 +465,8 @@ public class GameSession : IDisposable
         return new PendingEncounterDetailView
         {
             EdgeId = pending.EdgeId.ToString(),
-            FromNodeId = _gameRoom.Edges[pending.EdgeId].From.Value,
-            ToNodeId = _gameRoom.Edges[pending.EdgeId].To.Value,
+            FromNodeId = gameRoom.Edges[pending.EdgeId].From.Value,
+            ToNodeId = gameRoom.Edges[pending.EdgeId].To.Value,
 
             MyUnitCount = myGroup.UnitCount,
             MyDestinationNodeId = myGroup.Destination.Value,
@@ -386,80 +486,79 @@ public class GameSession : IDisposable
     // 해소 트리거
     private async Task CheckAndResolveIfReadyAsync()
     {
-        if (!_gameRoom.IsReadyForResolution())
-            return;
-
-        bool allReady = _playerStates.Values
-            .Where(s => s.IsConnected)
-            .All(s => IsMoveCommandCompleted(s.Side) && (s.EncounterDecisionsCompleted || !_gameRoom.GetUndecidedEncounters(s.Side).Any()));
-
-        if (allReady)
+        await ExecuteOnGameRoomAsync(async gameRoom =>
         {
-            await ResolveRoundAsync();
-        }
+            if (!gameRoom.IsReadyForResolution())
+                return "";
+
+            // 로컬 서버의 플레이어 소켓 연결 여부와 상관없이 비즈니스 상태 기준으로만 해소 판단
+            bool allReady = new[] { PlayerSide.A, PlayerSide.B }
+                .All(side => IsMoveCommandCompleted(side, gameRoom) && !gameRoom.GetUndecidedEncounters(side).Any());
+
+            if (allReady)
+            {
+                await ResolveRoundAsync(gameRoom);
+            }
+            return "";
+        });
     }
 
-    private async Task ResolveRoundAsync()
+    private async Task ResolveRoundAsync(GameRoom gameRoom)
     {
         StopPlanningTimer();
 
-        var result = _gameRoom.ResolveRound();
+        var result = gameRoom.ResolveRound();
 
-        await BroadcastEventsAsync();
+        await PublishAndBroadcastEventsAsync(gameRoom);
 
         foreach (var state in _playerStates.Values)
             state.ResetForNewRound();
 
-        OnRoundResolved?.Invoke(this, new RoundResolvedEventArgs(RoomId, _gameRoom.CurrentRound - 1));
-
-        await _repository.SaveAsync(_gameRoom);
+        OnRoundResolved?.Invoke(this, new RoundResolvedEventArgs(RoomId, gameRoom.CurrentRound - 1));
 
         if (result.GameOver)
         {
-            await HandleGameOverAsync(result.Winner, GameOverReason.AllNodesCaptured);
+            await HandleGameOverAsync(gameRoom, result.Winner, GameOverReason.AllNodesCaptured);
         }
         else
         {
-            StartPlanningTimer();
+            StartPlanningTimer(gameRoom.CurrentRound);
         }
     }
 
     // 타이머 관리
-    public void StartPlanningTimer()
+    public void StartPlanningTimer(int forRound)
     {
         StopPlanningTimer();
 
+        _planningTimerRound = forRound;
         _planningTimer = new Timer(_planningTimeout.TotalMilliseconds);
-        _planningTimer.Elapsed += async (_, _) => await OnPlanningTimeoutAsync();
+        _planningTimer.Elapsed += async (_, _) => await OnPlanningTimeoutAsync(forRound);
         _planningTimer.AutoReset = false;
         _planningTimer.Start();
     }
 
-    private async Task OnPlanningTimeoutAsync()
+    private async Task OnPlanningTimeoutAsync(int forRound)
     {
-        await _lock.WaitAsync();
-        try
+        await ExecuteOnGameRoomAsync(async gameRoom =>
         {
-            if (_gameRoom.Phase != GamePhase.Planning) return;
+            // 락 획득 후 Redis 데이터 라운드가 타이머를 구동할 당시의 라운드 정보와 다르면 무시
+            if (gameRoom.Phase != GamePhase.Planning || gameRoom.CurrentRound != forRound) 
+                return "";
 
             // 미결정 조우는 기본값(Retreat)으로 자동 처리
             foreach (var side in new[] { PlayerSide.A, PlayerSide.B })
             {
-                if (!_playerStates[side].IsConnected) continue;
-
-                var undecided = _gameRoom.GetUndecidedEncounters(side);
+                var undecided = gameRoom.GetUndecidedEncounters(side);
                 foreach (var enc in undecided)
                 {
-                    _gameRoom.ResolveEncounter(enc.EdgeId, side, EncounterDecision.Retreat);
+                    gameRoom.ResolveEncounter(enc.EdgeId, side, EncounterDecision.Retreat);
                 }
             }
 
-            await ResolveRoundAsync();
-        }
-        finally
-        {
-            _lock.Release();
-        }
+            await ResolveRoundAsync(gameRoom);
+            return "";
+        });
     }
 
     private void StopPlanningTimer()
@@ -470,45 +569,42 @@ public class GameSession : IDisposable
     }
 
     // 게임 종료
-    private async Task HandleGameOverAsync(PlayerSide? winner, GameOverReason reason)
+    private Task HandleGameOverAsync(GameRoom gameRoom, PlayerSide? winner, GameOverReason reason)
     {
         StopPlanningTimer();
         OnGameOver?.Invoke(this, new GameOverEventArgs(RoomId, winner, reason));
-        await _repository.SaveAsync(_gameRoom);
+        return Task.CompletedTask;
     }
 
     private async Task ForceGameOverAsync(GameOverReason reason)
     {
-        await _lock.WaitAsync();
-        try
+        await ExecuteOnGameRoomAsync(async gameRoom =>
         {
-            if (_gameRoom.Phase == GamePhase.GameOver) return;
+            if (gameRoom.Phase == GamePhase.GameOver) return "";
 
             PlayerSide? winner = reason == GameOverReason.PlayerDisconnected
                 ? _playerStates.First(s => s.Value.IsConnected).Key
                 : null;
 
-            await HandleGameOverAsync(winner, reason);
-        }
-        finally
-        {
-            _lock.Release();
-        }
+            gameRoom.ForceGameOver(winner, reason);
+
+            await PublishAndBroadcastEventsAsync(gameRoom);
+
+            StopPlanningTimer();
+            OnGameOver?.Invoke(this, new GameOverEventArgs(RoomId, winner, reason));
+
+            return "";
+        });
     }
 
     // 이벤트 브로드캐스트
-    // 변경: 이벤트를 버퍼에 저장하고 모든 플레이어에게 동시 전송
-    private async Task BroadcastEventsAsync()
+    private async Task PublishAndBroadcastEventsAsync(GameRoom gameRoom)
     {
-        // 이벤트 복사 작업 
-        var events = _gameRoom.DomainEvents.ToList();
+        var events = gameRoom.FlushDomainEvents();
         if (!events.Any()) return;
 
         foreach (var domainEvent in events)
         {
-            // 1. 시퀀스 번호 부여 및 버퍼 저장
-            // Interlocked을 이용하여 원자적으로 값이 증가하도록 보장 
-            // ref 안전한 포인터를 전달
             var sequenceNumber = Interlocked.Increment(ref _eventSequence);
             _eventBuffer.Add(new BufferedEvent
             {
@@ -517,14 +613,11 @@ public class GameSession : IDisposable
                 Timestamp = DateTime.UtcNow
             });
 
-            // 2. 브로드 캐스트 진행 [시퀀스 번호를 전달하여 재연결 시 누락된 데이터 동기화 진행용 ]
             await BroadcastSingleEventAsync(domainEvent, sequenceNumber);
         }
-
-        _gameRoom.ClearDomainEvents();
     }
 
-    // [버퍼링된 이벤트 조회]  재연결 클라이언트용 메서드 
+    // [버퍼링된 이벤트 조회] 재연결 클라이언트용 메서드 
     public List<BufferedEvent> GetEventsAfter(long lastSeenSequence)
     {
         return _eventBuffer
@@ -550,7 +643,33 @@ public class GameSession : IDisposable
             });
             if (message == null) return;
 
-            // 이벤트 데이터를 적절한 타입으로 역직렬화
+            // 자기 서버가 보낸 이벤트는 무시
+            if (message.SourceServerId == Environment.MachineName) return;
+
+            // 메타데이터 업데이트 및 타이머 정렬
+            if (message.EventType == nameof(RoundResolved))
+            {
+                var resolved = JsonSerializer.Deserialize<RoundResolved>(message.EventData.GetRawText(), new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                    PropertyNameCaseInsensitive = true
+                });
+                if (resolved != null)
+                {
+                    _currentPhase = GamePhase.Planning;
+                    _currentRound = resolved.CompletedRound + 1;
+
+                    // 원격에서 라운드가 해소되었으므로 로컬 타이머 중지 및 새 라운드 타이머 구동
+                    StartPlanningTimer(_currentRound);
+                }
+            }
+            else if (message.EventType == nameof(GameOver))
+            {
+                _currentPhase = GamePhase.GameOver;
+                StopPlanningTimer();
+            }
+
+            // 이벤트를 클라이언트에게 WebSocket으로 전송
             var eventType = Type.GetType($"HexWar.Domain.Events.{message.EventType}, HexWar.Domain");
             if (eventType == null) return;
 
@@ -563,7 +682,6 @@ public class GameSession : IDisposable
 
             if (domainEvent == null) return;
 
-            // 이 서버에 연결된 클라이언트들에게 WebSocket으로 전송
             await _eventBroadcaster.BroadcastToRoomAsync(RoomId, domainEvent, message.SequenceNumber);
 
             // CircularBuffer에도 저장 (재연결 복구용)
@@ -604,8 +722,6 @@ public class GameSession : IDisposable
                 await _eventBroadcaster.BroadcastToRoomAsync(RoomId, domainEvent, sequenceNumber);
                 break;
 
-            // UnitsArrived, UnitsRetreated 등은 RoundResolved에 포함되어 있으므로
-            // 별도 브로드캐스트하지 않음 (버퍼에만 저장)
             default:
                 break;
         }
@@ -618,44 +734,43 @@ public class GameSession : IDisposable
     }
 
     // 유틸리티
-    private bool HasHeadquartersVision(PlayerSide side)
+    private bool HasHeadquartersVision(PlayerSide side, GameRoom gameRoom)
     {
-        var hq = _gameRoom.Nodes.Values.FirstOrDefault(n => n.IsHeadquarters);
+        var hq = gameRoom.Nodes.Values.FirstOrDefault(n => n.IsHeadquarters);
         return hq != null && hq.GetTotalCount(side) > 0;
     }
 
-    private string? BuildWinnerString()
+    private string? BuildWinnerString(GameRoom gameRoom)
     {
-        if (_gameRoom.Phase != GamePhase.GameOver) return null;
+        if (gameRoom.Phase != GamePhase.GameOver) return null;
 
-        int nodesA = _gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerA);
-        int nodesB = _gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerB);
+        int nodesA = gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerA);
+        int nodesB = gameRoom.Nodes.Values.Count(n => n.Ownership == NodeOwnership.PlayerB);
 
         if (nodesA > nodesB) return PlayerSide.A.ToString();
         if (nodesB > nodesA) return PlayerSide.B.ToString();
         return "Draw";
     }
 
-    private bool IsMoveCommandCompleted(PlayerSide side)
+    private bool IsMoveCommandCompleted(PlayerSide side, GameRoom gameRoom)
     {
         return _playerStates[side].MoveCommandCompleted ||
-               _gameRoom.GetRemainingUnits(side) <= 0 ||
-               _gameRoom.Nodes.Values.Sum(n => n.GetMobileCount(side)) == 0;
+               gameRoom.GetRemainingUnits(side) <= 0 ||
+               gameRoom.Nodes.Values.Sum(n => n.GetMobileCount(side)) == 0;
     }
 
     public void Dispose()
     {
         StopPlanningTimer();
-        
+
         if (_eventPublisher != null)
         {
-            _eventPublisher.Unsubscribe(_gameRoom.RoomId);
+            _eventPublisher.Unsubscribe(_roomId);
         }
 
         _eventBuffer.Dispose();
         _lock.Dispose();
 
-        // 이벤트 핸들러 참조 해제 
         OnGameOver = null;
         OnRoundResolved = null;
     }

@@ -1,20 +1,30 @@
 namespace HexWar.Domain.Entities;
 
+using System.Text.Json.Serialization;
 using HexWar.Domain.Enums;
 using HexWar.Domain.ValueObjects;
 
 public class Edge
 {
-    public EdgeId Id { get; }
-    public NodeId From { get; }
-    public NodeId To { get; }
-    public Distance Distance { get; }
+    [JsonInclude]
+    public EdgeId Id { get; private set; }
+
+    [JsonInclude]
+    public NodeId From { get; private set; }
+
+    [JsonInclude]
+    public NodeId To { get; private set; }
+
+    [JsonInclude]
+    public Distance Distance { get; private set; }
 
     // 현재 간선 내 이동 중인 유닛 배치 정보
     // Key : 남은 라운드 수 Value 이동 정보
     // 라운드 별로 빠른 접근이 가능하고, 정렬되어있어 순회하기 용이함으로 해당 컬렉션 객체 선택 
-    public SortedList<int, List<TravelingGroup>> TravelingUnits { get; } = new();
+    [JsonInclude]
+    public SortedList<int, List<TravelingGroup>> TravelingUnits { get; private set; } = new();
 
+    [JsonConstructor]
     public Edge(NodeId from, NodeId to, Distance distance)
     {
         Id = new EdgeId(from, to);

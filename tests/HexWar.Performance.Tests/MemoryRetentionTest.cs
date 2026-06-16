@@ -305,8 +305,6 @@ public class MemoryRetentionTest
     /// </summary>
     private GameRoom GetGameRoom(GameSession session)
     {
-        var field = typeof(GameSession).GetField("_gameRoom",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        return (GameRoom)field!.GetValue(session)!;
+        return _repository.GetByIdAsync(session.RoomId).GetAwaiter().GetResult()!;
     }
 }
