@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Core;
+using Grpc.AspNetCore.Server;
 using HexWar.Application.Sessions;
 using HexWar.Matchmaking;
 using Microsoft.Extensions.Logging;
@@ -22,7 +23,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
     private readonly ISubscriber? _sub;
     
     // 매칭 완료된 플레이어에게 결과를 전달하기 위한 채널과 비동기 완료 알림용 TaskCompletionSource
-    private readonly ConcurrentDictionary<string, (IServerStreamWriter<MatchmakingUpdate> Stream, TaskCompletionSource<MatchmakingUpdate> Completion)> _waitingPlayers = new();
+    private readonly ConcurrentDictionary<string, (IServerStreamWriter<MatchmakingUpdate> Stream, TaskCompletionSource<MatchmakingUpdate> Completion, string ClientHost)> _waitingPlayers = new();
 
     public MatchmakingService(
         MatchmakingQueue queue,
@@ -57,11 +58,10 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
             _logger.LogInformation("Received distributed match event: {RoomId}, Player1={P1}, Player2={P2}", 
                 payload.RoomId, payload.Player1Id, payload.Player2Id);
 
-            var wsEndpoint = $"ws://localhost:5183/ws/game/{payload.RoomId}";
-
             // Player 1에게 매칭 결과 전송
             if (_waitingPlayers.TryGetValue(payload.Player1Id, out var state1))
             {
+                var wsEndpoint = $"ws://{state1.ClientHost}/ws/game/{payload.RoomId}";
                 state1.Completion.TrySetResult(new MatchmakingUpdate
                 {
                     Status = MatchmakingStatus.Matched,
@@ -78,6 +78,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
             // Player 2에게 매칭 결과 전송
             if (_waitingPlayers.TryGetValue(payload.Player2Id, out var state2))
             {
+                var wsEndpoint = $"ws://{state2.ClientHost}/ws/game/{payload.RoomId}";
                 state2.Completion.TrySetResult(new MatchmakingUpdate
                 {
                     Status = MatchmakingStatus.Matched,
@@ -120,7 +121,9 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
 
         // 응답 스트림 및 완료 알림 등록
         var matchCompletion = new TaskCompletionSource<MatchmakingUpdate>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _waitingPlayers[playerId] = (responseStream, matchCompletion);
+        var httpContext = context.GetHttpContext();
+        var clientHost = httpContext?.Request.Host.Value ?? "localhost:5183";
+        _waitingPlayers[playerId] = (responseStream, matchCompletion, clientHost);
 
         // 큐에 등록
         var queuedPlayer = await _queue.EnqueueAsync(playerId, request.Rating, context.CancellationToken);
@@ -226,12 +229,10 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
             }
             else
             {
-                // WebSocket 엔드포인트
-                var wsEndpoint = $"ws://localhost:5183/ws/game/{roomId}";
-
                 // Player 1에게 매칭 결과 전송
                 if (_waitingPlayers.TryGetValue(e.Player1.PlayerId, out var state1))
                 {
+                    var wsEndpoint = $"ws://{state1.ClientHost}/ws/game/{roomId}";
                     state1.Completion.TrySetResult(new MatchmakingUpdate
                     {
                         Status = MatchmakingStatus.Matched,
@@ -248,6 +249,7 @@ public class MatchmakingService : HexWar.Matchmaking.MatchmakingService.Matchmak
                 // Player 2에게 매칭 결과 전송
                 if (_waitingPlayers.TryGetValue(e.Player2.PlayerId, out var state2))
                 {
+                    var wsEndpoint = $"ws://{state2.ClientHost}/ws/game/{roomId}";
                     state2.Completion.TrySetResult(new MatchmakingUpdate
                     {
                         Status = MatchmakingStatus.Matched,

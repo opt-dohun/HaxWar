@@ -37,30 +37,43 @@ public class RedisDistributedLock : IDistributedLock
     }
 
     public async Task<IDistributedLockHandle?> TryAcquireAsync(
-        string resourceKey, TimeSpan expiry)
+        string resourceKey, TimeSpan expiry, TimeSpan? acquireTimeout = null)
     {
         var lockKey = $"lock:{resourceKey}";
-        var lockId = $"{Environment.MachineName}:{Guid.NewGuid():N}";
+        var lockId = $"{ServerIdentity.Id}:{Guid.NewGuid():N}";
+        var deadline = acquireTimeout.HasValue
+            ? DateTime.UtcNow + acquireTimeout.Value
+            : DateTime.UtcNow; // 단발 시도
+
+        const int retryIntervalMs = 50;
 
         try
         {
-            // SET lock:gameroom:room-123 "server-1:abc123" NX PX 5000
-            // 이미 존재할 경우 
-            var acquired = await _db.StringSetAsync(
-                lockKey,
-                lockId,
-                expiry,
-                When.NotExists,     // NX: 키가 없을 때만 설정
-                CommandFlags.None);
-
-            if (acquired)
+            while (true)
             {
-                _logger.LogDebug("Lock acquired: {Key} by {LockId}", lockKey, lockId);
-                return new RedisLockHandle(_db, lockKey, lockId, _logger);
-            }
+                var acquired = await _db.StringSetAsync(
+                    lockKey,
+                    lockId,
+                    expiry,
+                    When.NotExists,
+                    CommandFlags.None);
 
-            _logger.LogDebug("Lock contention: {Key} is held by another server", lockKey);
-            return null;
+                if (acquired)
+                {
+                    _logger.LogDebug("Lock acquired: {Key} by {LockId}", lockKey, lockId);
+                    return new RedisLockHandle(_db, lockKey, lockId, _logger);
+                }
+
+                var remaining = deadline - DateTime.UtcNow;
+                if (remaining.TotalMilliseconds <= 0)
+                {
+                    _logger.LogDebug("Lock contention: {Key} is held by another server", lockKey);
+                    return null;
+                }
+
+                var waitMs = (int)Math.Min(retryIntervalMs, remaining.TotalMilliseconds);
+                await Task.Delay(waitMs);
+            }
         }
         catch (Exception ex)
         {

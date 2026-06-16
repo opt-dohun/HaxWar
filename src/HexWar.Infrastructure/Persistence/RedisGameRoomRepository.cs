@@ -120,7 +120,7 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
         {
             RoomId = roomId,
             PlayerSide = playerSide,
-            ServerId = Environment.MachineName,
+            ServerId = ServerIdentity.Id,
             ConnectedAt = DateTime.UtcNow
         };
 

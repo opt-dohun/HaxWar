@@ -63,7 +63,7 @@ public class RedisEventPublisher : IGameEventPublisher, IDisposable
                 EventType = domainEvent.GetType().Name,
                 EventData = JsonSerializer.SerializeToElement(domainEvent, JsonOptions),
                 SequenceNumber = sequenceNumber,
-                SourceServerId = Environment.MachineName,
+                SourceServerId = ServerIdentity.Id,
                 Timestamp = DateTime.UtcNow
             };
 
@@ -102,7 +102,7 @@ public class RedisEventPublisher : IGameEventPublisher, IDisposable
                 if (message == null) return;
 
                 // 자기 서버에서 발행한 이벤트는 무시 (루프 방지)
-                if (message.SourceServerId == Environment.MachineName)
+                if (message.SourceServerId == ServerIdentity.Id)
                 {
                     _logger.LogTrace("Ignoring self-published event for room {RoomId}", roomId);
                     return;

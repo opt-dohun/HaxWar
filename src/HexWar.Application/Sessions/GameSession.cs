@@ -21,6 +21,7 @@ using HexWar.Domain.Enums;
 using HexWar.Domain.Events;
 using HexWar.Domain.Exceptions;
 using HexWar.Domain.ValueObjects;
+using HexWar.Domain.Serialization;
 using Timer = System.Timers.Timer;
 
 /// <summary>
@@ -122,11 +123,11 @@ public class GameSession : IDisposable
             // 분산 모드: Redis 락 + Redis에서 GameRoom 로드
             // ============================================================
             using var lockHandle = await _distributedLock.TryAcquireAsync(
-                $"gameroom:{_roomId}", TimeSpan.FromSeconds(5));
+                $"gameroom:{_roomId}", TimeSpan.FromSeconds(5), acquireTimeout: TimeSpan.FromMilliseconds(500));
 
             if (lockHandle == null)
             {
-                _logger?.LogWarning("Lock contention for room {RoomId}: Busy", _roomId);
+                _logger?.LogWarning("Lock contention for room {RoomId}: gave up after 500ms", _roomId);
                 return null; // 락 획득 실패
             }
 
@@ -644,16 +645,12 @@ public class GameSession : IDisposable
             if (message == null) return;
 
             // 자기 서버가 보낸 이벤트는 무시
-            if (message.SourceServerId == Environment.MachineName) return;
+            if (message.SourceServerId == ServerIdentity.Id) return;
 
             // 메타데이터 업데이트 및 타이머 정렬
             if (message.EventType == nameof(RoundResolved))
             {
-                var resolved = JsonSerializer.Deserialize<RoundResolved>(message.EventData.GetRawText(), new JsonSerializerOptions
-                {
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                    PropertyNameCaseInsensitive = true
-                });
+                var resolved = JsonSerializer.Deserialize<RoundResolved>(message.EventData.GetRawText(), DomainEventSerializerOptions.Create());
                 if (resolved != null)
                 {
                     _currentPhase = GamePhase.Planning;
@@ -674,11 +671,7 @@ public class GameSession : IDisposable
             if (eventType == null) return;
 
             var domainEvent = JsonSerializer.Deserialize(
-                message.EventData.GetRawText(), eventType, new JsonSerializerOptions
-                {
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                    PropertyNameCaseInsensitive = true
-                }) as IDomainEvent;
+                message.EventData.GetRawText(), eventType, DomainEventSerializerOptions.Create()) as IDomainEvent;
 
             if (domainEvent == null) return;
 

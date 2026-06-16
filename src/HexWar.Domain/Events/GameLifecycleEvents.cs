@@ -76,21 +76,21 @@ public sealed record RoundResolved : DomainEvent
     public RoundResolved(
         string roomId,
         int completedRound,
-        IEnumerable<MoveExecutionRecord> moveExecutions,
-        IEnumerable<ArrivalRecord> arrivals,
-        IEnumerable<EncounterRecord> encounters,
-        IEnumerable<OwnershipChangeRecord> ownershipChanges,
-        IEnumerable<EncounterResolvedRecord> resolvedEncounters,
-        Dictionary<int, NodeStateSnapshot> nodeSnapshots)
+        IReadOnlyList<MoveExecutionRecord> moveExecutions,
+        IReadOnlyList<ArrivalRecord> arrivals,
+        IReadOnlyList<EncounterRecord> encounters,
+        IReadOnlyList<OwnershipChangeRecord> ownershipChanges,
+        IReadOnlyList<EncounterResolvedRecord> resolvedEncounters,
+        IReadOnlyDictionary<int, NodeStateSnapshot> nodeSnapshots)
         : base(roomId)
     {
         CompletedRound = completedRound;
-        MoveExecutions = moveExecutions.ToList().AsReadOnly();
-        Arrivals = arrivals.ToList().AsReadOnly();
-        Encounters = encounters.ToList().AsReadOnly();
-        OwnershipChanges = ownershipChanges.ToList().AsReadOnly();
-        ResolvedEncounters = resolvedEncounters.ToList().AsReadOnly();
-        NodeSnapshots = nodeSnapshots.AsReadOnly();
+        MoveExecutions = moveExecutions;
+        Arrivals = arrivals;
+        Encounters = encounters;
+        OwnershipChanges = ownershipChanges;
+        ResolvedEncounters = resolvedEncounters;
+        NodeSnapshots = nodeSnapshots;
     }
 }
 
@@ -156,13 +156,13 @@ public sealed record GameOver : DomainEvent
         PlayerSide? winner,
         GameOverReason reason,
         int finalRound,
-        Dictionary<PlayerSide, int> finalScores)
+        IReadOnlyDictionary<PlayerSide, int> finalScores)
         : base(roomId)
     {
         Winner = winner;
         Reason = reason;
         FinalRound = finalRound;
-        FinalScores = finalScores.AsReadOnly();
+        FinalScores = finalScores;
     }
 }
 
