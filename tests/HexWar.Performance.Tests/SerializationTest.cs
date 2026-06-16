@@ -321,4 +321,60 @@ public class SerializationTest
         Assert.That(passivePlanningTimer, Is.Null, "Passive server should NOT start primary timer");
         Assert.That(passiveBackupTimer, Is.Not.Null, "Passive server should start backup timer");
     }
+
+    [Test]
+    public void VerifyDeadlineBroadcastingAndSync()
+    {
+        var repo = new InMemoryGameRoomRepository();
+        var broadcaster = new DummyEventBroadcaster();
+        var roomId = "deadline-sync-room";
+
+        var room = new GameRoom(roomId);
+        room.InitializeMap();
+        room.AddPlayer(new PlayerId("player-A"));
+        room.AddPlayer(new PlayerId("player-B"));
+        room.AssignOwner("owner-server-123");
+        repo.SaveAsync(room).Wait();
+
+        using var passiveSession = new HexWar.Application.Sessions.GameSession(roomId, broadcaster, repo);
+        
+        // Connect player on passive server (starts default timer first)
+        passiveSession.OnPlayerConnectedAsync(PlayerSide.B).Wait();
+
+        var backupTimerField = typeof(HexWar.Application.Sessions.GameSession).GetField("_backupPlanningTimer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var deadlineField = typeof(HexWar.Application.Sessions.GameSession).GetField("_planningDeadline", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+        var firstTimer = backupTimerField?.GetValue(passiveSession);
+        Assert.That(firstTimer, Is.Not.Null);
+
+        // Now simulate a remote GameStarted event from owner-server-123 with a specific deadline (e.g. 20s from now)
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        var gameStartedEvent = new GameStarted(roomId, new PlayerId("player-A"), new PlayerId("player-B"), deadline);
+
+        // Serialize and simulate receiving remote event via private HandleRemoteEventAsync
+        var pubOptions = DomainJsonOptions.Create();
+        var message = new HexWar.Application.Messaging.DistributedEventMessage
+        {
+            RoomId = roomId,
+            EventType = gameStartedEvent.GetType().Name,
+            EventData = JsonSerializer.SerializeToElement(gameStartedEvent, gameStartedEvent.GetType(), pubOptions),
+            SequenceNumber = 1,
+            SourceServerId = "owner-server-123",
+            Timestamp = DateTime.UtcNow
+        };
+        var redisJson = JsonSerializer.Serialize(message, pubOptions);
+
+        var handleRemoteMethod = typeof(HexWar.Application.Sessions.GameSession).GetMethod("HandleRemoteEventAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        
+        var task = handleRemoteMethod?.Invoke(passiveSession, new object[] { redisJson }) as Task;
+        task?.Wait();
+
+        var syncedDeadline = deadlineField?.GetValue(passiveSession) as DateTime?;
+        Assert.That(syncedDeadline, Is.Not.Null);
+        Assert.That((syncedDeadline.Value - deadline).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)));
+
+        var secondTimer = backupTimerField?.GetValue(passiveSession);
+        Assert.That(secondTimer, Is.Not.Null);
+        Assert.That(secondTimer, Is.Not.SameAs(firstTimer), "Passive backup timer should have been re-created and synchronized to deadline");
+    }
 }

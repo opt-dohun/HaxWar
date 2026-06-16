@@ -134,7 +134,7 @@ public partial class GameRoom
     }
 
     // 플레이어 참가 
-    public PlayerSide AddPlayer(PlayerId playerId)
+    public PlayerSide AddPlayer(PlayerId playerId, DateTime? gameStartDeadline = null)
     {
         if (Players.Count >= 2)
         {
@@ -163,7 +163,7 @@ public partial class GameRoom
             Phase = GamePhase.Planning;
             CurrentRound = 1;
             // 이벤트 발생 목록에 추가 
-            RaiseEvent(new GameStarted(RoomId, Players[PlayerSide.A], Players[PlayerSide.B]));
+            RaiseEvent(new GameStarted(RoomId, Players[PlayerSide.A], Players[PlayerSide.B], gameStartDeadline ?? DateTime.UtcNow.AddSeconds(30)));
         }
 
         return side;

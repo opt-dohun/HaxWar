@@ -160,9 +160,18 @@ class GameUI {
         this.lastRound = localState.currentRound;
 
         if (localState.phase === 'Planning') {
+            let remaining = 30;
+            if (localState.deadline) {
+                const deadlineMs = new Date(localState.deadline).getTime();
+                const nowMs = Date.now();
+                remaining = Math.max(0, Math.round((deadlineMs - nowMs) / 1000));
+            }
             if (roundChanged || phaseChanged || !this.timerInterval) {
-                this.startCountdown(30);
+                this.startCountdown(remaining);
             } else {
+                if (Math.abs(this.timeRemaining - remaining) > 2) {
+                    this.timeRemaining = remaining;
+                }
                 this.updateTimerDisplay();
             }
         } else {

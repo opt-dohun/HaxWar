@@ -12,6 +12,7 @@ public class GameStateView
     // Planning 상태
     public int MyRemainingUnits { get; init; }
     public List<PendingMoveView> MyPendingMoves { get; init; } = new();
+    public DateTime? Deadline { get; set; }
     public bool MoveCommandCompleted { get; init; }
     public bool EncounterDecisionsCompleted { get; init; }
     public bool IsMyPlanningComplete { get; init; }

@@ -55,7 +55,7 @@ public partial class GameRoom
     }
 
     // 
-    public RoundResolutionResult ResolveRound()
+    public RoundResolutionResult ResolveRound(DateTime? nextRoundDeadline = null)
     {
         if (Phase != GamePhase.Planning)
             throw new DomainException("Cannot resolve round outside Planning phase");
@@ -226,7 +226,7 @@ public partial class GameRoom
         else
         {
             Phase = GamePhase.Planning;
-            RaiseEvent(new RoundStarted(RoomId, CurrentRound));
+            RaiseEvent(new RoundStarted(RoomId, CurrentRound, nextRoundDeadline ?? DateTime.UtcNow.AddSeconds(30)));
             result.GameOver = false;
         }
 

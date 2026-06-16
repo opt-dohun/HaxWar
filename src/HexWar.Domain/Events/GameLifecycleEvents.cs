@@ -18,12 +18,16 @@ public sealed record GameStarted : DomainEvent
     /// <summary>시작 라운드 번호 (항상 1)</summary>
     public int StartingRound { get; init; }
 
-    public GameStarted(string roomId, PlayerId playerAId, PlayerId playerBId)
+    /// <summary>첫 라운드 종료 예정 시각 (UTC)</summary>
+    public DateTime Deadline { get; init; }
+
+    public GameStarted(string roomId, PlayerId playerAId, PlayerId playerBId, DateTime deadline)
         : base(roomId)
     {
         PlayerAId = playerAId;
         PlayerBId = playerBId;
         StartingRound = 1;
+        Deadline = deadline;
     }
 }
 
@@ -39,11 +43,15 @@ public sealed record RoundStarted : DomainEvent
     /// <summary>현재 게임 단계</summary>
     public GamePhase Phase { get; init; }
 
-    public RoundStarted(string roomId, int roundNumber)
+    /// <summary>계획 단계 종료 예정 시각 (UTC)</summary>
+    public DateTime Deadline { get; init; }
+
+    public RoundStarted(string roomId, int roundNumber, DateTime deadline)
         : base(roomId)
     {
         RoundNumber = roundNumber;
         Phase = GamePhase.Planning;
+        Deadline = deadline;
     }
 }
 
