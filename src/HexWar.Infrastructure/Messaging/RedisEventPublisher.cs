@@ -10,6 +10,7 @@ using StackExchange.Redis;
 using HexWar.Application.Messaging;
 using HexWar.Application.Services;
 using HexWar.Domain.Events;
+using HexWar.Infrastructure.Serialization;
 
 /// <summary>
 /// Redis Pub/Sub을 통한 분산 이벤트 발행/구독 구현체
@@ -29,11 +30,7 @@ public class RedisEventPublisher : IGameEventPublisher, IDisposable
     // roomId → 구독 핸들러 매핑
     private readonly ConcurrentDictionary<string, Func<string, Task>> _subscriptions = new();
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = true
-    };
+    private static readonly JsonSerializerOptions JsonOptions = DomainJsonOptions.Create();
 
     public RedisEventPublisher(
         IConnectionMultiplexer redis,
@@ -61,7 +58,7 @@ public class RedisEventPublisher : IGameEventPublisher, IDisposable
             {
                 RoomId = roomId,
                 EventType = domainEvent.GetType().Name,
-                EventData = JsonSerializer.SerializeToElement(domainEvent, JsonOptions),
+                EventData = JsonSerializer.SerializeToElement(domainEvent, domainEvent.GetType(), JsonOptions),
                 SequenceNumber = sequenceNumber,
                 SourceServerId = ServerIdentity.Id,
                 Timestamp = DateTime.UtcNow

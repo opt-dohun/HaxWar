@@ -29,6 +29,7 @@ public static class DomainJsonOptions
         options.Converters.Add(new PlayerIdJsonConverter());
         options.Converters.Add(new EdgeIdJsonConverter());
         options.Converters.Add(new DistanceJsonConverter());
+        options.Converters.Add(new JsonStringEnumConverter());
 
         return options;
     }

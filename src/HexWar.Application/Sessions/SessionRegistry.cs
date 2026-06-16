@@ -14,6 +14,7 @@ public class SessionRegistry
     private readonly IGameEventPublisher? _eventPublisher;
     private readonly IDistributedLock? _distributedLock;
     private readonly ILogger<GameSession>? _logger;
+    private readonly SemaphoreSlim _lock = new(1, 1);
 
     public SessionRegistry(
         IGameRoomRepository repository,
@@ -32,31 +33,40 @@ public class SessionRegistry
     // 새로운 게임 세션 생성
     public async Task<GameSession> CreateSessionAsync(string roomId)
     {
-        if (_sessions.ContainsKey(roomId))
-            throw new InvalidOperationException($"Session {roomId} already exists");
-
-        var gameRoom = new GameRoom(roomId);
-        gameRoom.InitializeMap();
-        await _repository.SaveAsync(gameRoom);
-
-        var session = new GameSession(
-            roomId, 
-            _eventBroadcaster, 
-            _repository, 
-            _eventPublisher, 
-            _distributedLock, 
-            _logger);
-
-        // 종료 시 등록할 이벤트 핸들러 - 게임 종료 후 1분 뒤 메모리에서 제거 
-        session.OnGameOver += async (s, e) =>
+        await _lock.WaitAsync();
+        try
         {
-            await Task.Delay(TimeSpan.FromMinutes(1));
-            _sessions.TryRemove(roomId, out _);
-        };
+            if (_sessions.ContainsKey(roomId))
+                throw new InvalidOperationException($"Session {roomId} already exists");
 
-        _sessions[roomId] = session;
+            var gameRoom = new GameRoom(roomId);
+            gameRoom.InitializeMap();
+            gameRoom.AssignOwner(HexWar.Application.Services.ServerIdentity.Id);
+            await _repository.SaveAsync(gameRoom);
 
-        return session;
+            var session = new GameSession(
+                roomId, 
+                _eventBroadcaster, 
+                _repository, 
+                _eventPublisher, 
+                _distributedLock, 
+                _logger);
+
+            // 종료 시 등록할 이벤트 핸들러 - 게임 종료 후 1분 뒤 메모리에서 제거 
+            session.OnGameOver += async (s, e) =>
+            {
+                await Task.Delay(TimeSpan.FromMinutes(1));
+                _sessions.TryRemove(roomId, out _);
+            };
+
+            _sessions[roomId] = session;
+
+            return session;
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     // 세션 조회 또는 Redis로부터 복원 (Hydrate)
@@ -67,27 +77,40 @@ public class SessionRegistry
             return session;
         }
 
-        if (await _repository.ExistsAsync(roomId))
+        await _lock.WaitAsync();
+        try
         {
-            var hydratedSession = new GameSession(
-                roomId, 
-                _eventBroadcaster, 
-                _repository, 
-                _eventPublisher, 
-                _distributedLock, 
-                _logger);
-
-            hydratedSession.OnGameOver += async (s, e) =>
+            if (_sessions.TryGetValue(roomId, out session))
             {
-                await Task.Delay(TimeSpan.FromMinutes(1));
-                _sessions.TryRemove(roomId, out _);
-            };
+                return session;
+            }
 
-            _sessions[roomId] = hydratedSession;
-            return hydratedSession;
+            if (await _repository.ExistsAsync(roomId))
+            {
+                var hydratedSession = new GameSession(
+                    roomId, 
+                    _eventBroadcaster, 
+                    _repository, 
+                    _eventPublisher, 
+                    _distributedLock, 
+                    _logger);
+
+                hydratedSession.OnGameOver += async (s, e) =>
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(1));
+                    _sessions.TryRemove(roomId, out _);
+                };
+
+                _sessions[roomId] = hydratedSession;
+                return hydratedSession;
+            }
+
+            return null;
         }
-
-        return null;
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     // 세션 조회 (로컬 전용)

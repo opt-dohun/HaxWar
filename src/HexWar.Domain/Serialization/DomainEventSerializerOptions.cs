@@ -23,6 +23,7 @@ public static class DomainEventSerializerOptions
         _options.Converters.Add(new PlayerIdJsonConverter());
         _options.Converters.Add(new EdgeIdJsonConverter());
         _options.Converters.Add(new DistanceJsonConverter());
+        _options.Converters.Add(new JsonStringEnumConverter());
     }
 
     public static JsonSerializerOptions Create() => _options;

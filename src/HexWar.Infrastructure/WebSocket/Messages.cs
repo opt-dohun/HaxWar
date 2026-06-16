@@ -1,3 +1,5 @@
+using HexWar.Infrastructure.Serialization;
+
 namespace HexWar.Infrastructure.WebSocket;
 
 using System.Text.Json;
@@ -122,11 +124,21 @@ public class ReconnectSyncPayload
 
 public static class JsonOptions
 {
-    public static readonly JsonSerializerOptions Default = new()
+    public static readonly JsonSerializerOptions Default;
+
+    static JsonOptions()
     {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = true,
-        WriteIndented = false,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+        Default = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true,
+            WriteIndented = false,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
+        Default.Converters.Add(new NodeIdJsonConverter());
+        Default.Converters.Add(new PlayerIdJsonConverter());
+        Default.Converters.Add(new EdgeIdJsonConverter());
+        Default.Converters.Add(new DistanceJsonConverter());
+        Default.Converters.Add(new JsonStringEnumConverter());
+    }
 }

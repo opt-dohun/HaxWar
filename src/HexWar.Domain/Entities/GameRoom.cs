@@ -13,6 +13,14 @@ public partial class GameRoom
     public string RoomId { get; private set; }
 
     [JsonInclude]
+    public string? OwnerServerId { get; private set; }
+
+    public void AssignOwner(string serverId)
+    {
+        OwnerServerId = serverId;
+    }
+
+    [JsonInclude]
     public GamePhase Phase { get; private set; }
 
     [JsonInclude]

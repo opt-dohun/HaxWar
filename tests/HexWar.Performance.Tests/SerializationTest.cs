@@ -107,4 +107,218 @@ public class SerializationTest
             }
         });
     }
+
+    [Test]
+    public void UnitsDeparted_Distributed_Serialization_Verification()
+    {
+        var pubOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true
+        };
+        var subOptions = HexWar.Domain.Serialization.DomainEventSerializerOptions.Create();
+        var ev = new UnitsDeparted("room-123", PlayerSide.A, new NodeId(1), 3, 1);
+        string json = JsonSerializer.Serialize(ev, pubOptions);
+        Console.WriteLine($"Publisher JSON: {json}");
+        var deserialized = JsonSerializer.Deserialize<UnitsDeparted>(json, subOptions);
+        Assert.That(deserialized, Is.Not.Null);
+        Assert.That(deserialized.RoomId, Is.EqualTo("room-123"));
+        Assert.That(deserialized.Side, Is.EqualTo(PlayerSide.A));
+        Assert.That(deserialized.FromNode, Is.EqualTo(new NodeId(1)));
+        Assert.That(deserialized.UnitCount, Is.EqualTo(3));
+        Assert.That(deserialized.RoundNumber, Is.EqualTo(1));
+    }
+
+    [Test]
+    public void RoundResolved_Serialization_Verification()
+    {
+        var pubOptions = DomainJsonOptions.Create();
+        var subOptions = HexWar.Domain.Serialization.DomainEventSerializerOptions.Create();
+
+        var arrivals = new List<ArrivalRecord>
+        {
+            new ArrivalRecord(new NodeId(2), PlayerSide.A, 5, new EdgeId(new NodeId(1), new NodeId(2)))
+        };
+        var ownershipChanges = new List<OwnershipChangeRecord>
+        {
+            new OwnershipChangeRecord
+            {
+                NodeId = 2,
+                PreviousOwner = "None",
+                NewOwner = "PlayerA",
+                IsSupplyLineActive = true
+            }
+        };
+
+        var ev = new RoundResolved(
+            roomId: "room-123",
+            completedRound: 1,
+            moveExecutions: new List<MoveExecutionRecord>(),
+            arrivals: arrivals,
+            encounters: new List<EncounterRecord>(),
+            ownershipChanges: ownershipChanges,
+            resolvedEncounters: new List<EncounterResolvedRecord>(),
+            nodeSnapshots: new Dictionary<int, NodeStateSnapshot>()
+        );
+
+        string json = JsonSerializer.Serialize(ev, pubOptions);
+        Console.WriteLine($"RoundResolved JSON: {json}");
+
+        var deserialized = JsonSerializer.Deserialize<RoundResolved>(json, subOptions);
+
+        Assert.That(deserialized, Is.Not.Null);
+        Assert.That(deserialized.RoomId, Is.EqualTo("room-123"));
+        Assert.That(deserialized.CompletedRound, Is.EqualTo(1));
+        Assert.That(deserialized.Arrivals, Has.Count.EqualTo(1));
+        Assert.That(deserialized.Arrivals[0].DestinationNodeId.Value, Is.EqualTo(2));
+        Assert.That(deserialized.Arrivals[0].Side, Is.EqualTo(PlayerSide.A));
+        Assert.That(deserialized.OwnershipChanges, Has.Count.EqualTo(1));
+        Assert.That(deserialized.OwnershipChanges[0].NodeId, Is.EqualTo(2));
+    }
+
+    [Test]
+    public void VerifyActiveVsPassiveWebSocketSerialization()
+    {
+        // 1. Create a RoundResolved event in memory
+        var arrivals = new List<ArrivalRecord>
+        {
+            new ArrivalRecord(new NodeId(2), PlayerSide.A, 5, new EdgeId(new NodeId(1), new NodeId(2)))
+        };
+        var ownershipChanges = new List<OwnershipChangeRecord>
+        {
+            new OwnershipChangeRecord
+            {
+                NodeId = 2,
+                PreviousOwner = "None",
+                NewOwner = "PlayerA",
+                IsSupplyLineActive = true
+            }
+        };
+
+        var domainEvent = new RoundResolved(
+            roomId: "room-123",
+            completedRound: 1,
+            moveExecutions: new List<MoveExecutionRecord>(),
+            arrivals: arrivals,
+            encounters: new List<EncounterRecord>(),
+            ownershipChanges: ownershipChanges,
+            resolvedEncounters: new List<EncounterResolvedRecord>(),
+            nodeSnapshots: new Dictionary<int, NodeStateSnapshot>()
+        );
+
+        // 2. Active Server WebSocket Serialization
+        var activeServerMessage = HexWar.Infrastructure.WebSocket.ServerMessage.FromDomainEvent(domainEvent, "room-123", 2, 10);
+        var activeBytes = JsonSerializer.SerializeToUtf8Bytes(activeServerMessage, HexWar.Infrastructure.WebSocket.JsonOptions.Default);
+        var activeJson = System.Text.Encoding.UTF8.GetString(activeBytes);
+
+        // 3. Redis Serialization (Active Server publishes)
+        var pubOptions = DomainJsonOptions.Create();
+        var message = new HexWar.Application.Messaging.DistributedEventMessage
+        {
+            RoomId = "room-123",
+            EventType = domainEvent.GetType().Name,
+            EventData = JsonSerializer.SerializeToElement(domainEvent, pubOptions),
+            SequenceNumber = 10,
+            SourceServerId = "server-A",
+            Timestamp = DateTime.UtcNow
+        };
+        var redisJson = JsonSerializer.Serialize(message, pubOptions);
+
+        // 4. Redis Deserialization (Passive Server subscribes)
+        var parsedMessage = JsonSerializer.Deserialize<HexWar.Application.Messaging.DistributedEventMessage>(redisJson, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true
+        });
+        
+        var eventType = Type.GetType($"HexWar.Domain.Events.{parsedMessage.EventType}, HexWar.Domain");
+        var passiveDomainEvent = JsonSerializer.Deserialize(
+            parsedMessage.EventData.GetRawText(), eventType, HexWar.Domain.Serialization.DomainEventSerializerOptions.Create()) as IDomainEvent;
+
+        // 5. Passive Server WebSocket Serialization
+        var passiveServerMessage = HexWar.Infrastructure.WebSocket.ServerMessage.FromDomainEvent(passiveDomainEvent, "room-123", 2, 10);
+        var passiveBytes = JsonSerializer.SerializeToUtf8Bytes(passiveServerMessage, HexWar.Infrastructure.WebSocket.JsonOptions.Default);
+        var passiveJson = System.Text.Encoding.UTF8.GetString(passiveBytes);
+
+        using var docActive = JsonDocument.Parse(activeJson);
+        using var docPassive = JsonDocument.Parse(passiveJson);
+
+        Assert.That(docPassive.RootElement.GetProperty("type").GetString(), Is.EqualTo(docActive.RootElement.GetProperty("type").GetString()));
+        Assert.That(docPassive.RootElement.GetProperty("event_type").GetString(), Is.EqualTo(docActive.RootElement.GetProperty("event_type").GetString()));
+        Assert.That(docPassive.RootElement.GetProperty("round").GetInt32(), Is.EqualTo(docActive.RootElement.GetProperty("round").GetInt32()));
+        Assert.That(docPassive.RootElement.GetProperty("sequence").GetInt64(), Is.EqualTo(docActive.RootElement.GetProperty("sequence").GetInt64()));
+        
+        // Compare payloads as raw JSON text
+        var activePayload = docActive.RootElement.GetProperty("payload").GetRawText();
+        var passivePayload = docPassive.RootElement.GetProperty("payload").GetRawText();
+        Assert.That(passivePayload, Is.EqualTo(activePayload));
+    }
+
+    private class DummyEventBroadcaster : HexWar.Application.Services.IEventBroadcaster
+    {
+        public Task BroadcastToRoomAsync(string roomId, IDomainEvent domainEvent, long sequenceNumber = 0) => Task.CompletedTask;
+        public Task BroadcastToRoomAsync<T>(string roomId, T message, long sequenceNumber = 0) where T : class => Task.CompletedTask;
+        public Task SendToPlayerAsync(string roomId, PlayerSide side, IDomainEvent domainEvent, long sequenceNumber = 0) => Task.CompletedTask;
+        public Task SendToPlayerAsync<T>(string roomId, PlayerSide side, T message, long sequenceNumber = 0) where T : class => Task.CompletedTask;
+    }
+
+    private class InMemoryGameRoomRepository : HexWar.Application.Services.IGameRoomRepository
+    {
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, GameRoom> _rooms = new();
+        public Task<GameRoom?> GetByIdAsync(string roomId) => Task.FromResult(_rooms.TryGetValue(roomId, out var r) ? r : null);
+        public Task SaveAsync(GameRoom gameRoom) { _rooms[gameRoom.RoomId] = gameRoom; return Task.CompletedTask; }
+        public Task<bool> ExistsAsync(string roomId) => Task.FromResult(_rooms.ContainsKey(roomId));
+        public Task DeleteAsync(string roomId) { _rooms.TryRemove(roomId, out _); return Task.CompletedTask; }
+    }
+
+    [Test]
+    public void VerifyOwnerAndBackupTimerLogic()
+    {
+        var repo = new InMemoryGameRoomRepository();
+        var broadcaster = new DummyEventBroadcaster();
+        var roomId = "timer-test-room";
+
+        // Create GameRoom and set owner to this server
+        var room = new GameRoom(roomId);
+        room.InitializeMap();
+        room.AddPlayer(new PlayerId("player-A"));
+        room.AddPlayer(new PlayerId("player-B"));
+        room.AssignOwner(HexWar.Application.Services.ServerIdentity.Id);
+        repo.SaveAsync(room).Wait();
+
+        // Instantiate GameSession (Owner Server)
+        using var ownerSession = new HexWar.Application.Sessions.GameSession(roomId, broadcaster, repo);
+        
+        // Connect player (triggers timer start)
+        ownerSession.OnPlayerConnectedAsync(PlayerSide.A).Wait();
+
+        // Reflection to read private timer fields
+        var planningTimerField = typeof(HexWar.Application.Sessions.GameSession).GetField("_planningTimer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var backupTimerField = typeof(HexWar.Application.Sessions.GameSession).GetField("_backupPlanningTimer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+        var ownerPlanningTimer = planningTimerField?.GetValue(ownerSession);
+        var ownerBackupTimer = backupTimerField?.GetValue(ownerSession);
+
+        Assert.That(ownerPlanningTimer, Is.Not.Null, "Owner server should start primary timer");
+        Assert.That(ownerBackupTimer, Is.Null, "Owner server should NOT start backup timer");
+
+        // Now simulate a game room owned by another server
+        var remoteRoomId = "remote-test-room";
+        var remoteRoom = new GameRoom(remoteRoomId);
+        remoteRoom.InitializeMap();
+        remoteRoom.AddPlayer(new PlayerId("player-A"));
+        remoteRoom.AddPlayer(new PlayerId("player-B"));
+        remoteRoom.AssignOwner("remote-server-999");
+        repo.SaveAsync(remoteRoom).Wait();
+
+        // Instantiate GameSession (Passive Server)
+        using var passiveSession = new HexWar.Application.Sessions.GameSession(remoteRoomId, broadcaster, repo);
+        passiveSession.OnPlayerConnectedAsync(PlayerSide.B).Wait();
+
+        var passivePlanningTimer = planningTimerField?.GetValue(passiveSession);
+        var passiveBackupTimer = backupTimerField?.GetValue(passiveSession);
+
+        Assert.That(passivePlanningTimer, Is.Null, "Passive server should NOT start primary timer");
+        Assert.That(passiveBackupTimer, Is.Not.Null, "Passive server should start backup timer");
+    }
 }

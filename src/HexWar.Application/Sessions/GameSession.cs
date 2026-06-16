@@ -53,11 +53,16 @@ public class GameSession : IDisposable
 
     // Planning 타이머
     private Timer? _planningTimer;
+    private Timer? _backupPlanningTimer;
     private readonly TimeSpan _planningTimeout;
     private int _planningTimerRound = -1;
+    private string? _ownerServerId;
 
     // 동시성 제어 (단일 서버 모드용)
     private readonly SemaphoreSlim _lock = new(1, 1);
+
+    // 타이머 동시성 제어 (분산/단일 서버 공통)
+    private readonly object _timerLock = new();
 
     public string RoomId => _roomId;
     public GamePhase CurrentPhase => _currentPhase;
@@ -193,6 +198,7 @@ public class GameSession : IDisposable
         _currentRound = gameRoom.CurrentRound;
         _maxRounds = gameRoom.MaxRounds;
         _players = new Dictionary<PlayerSide, PlayerId>(gameRoom.Players);
+        _ownerServerId = gameRoom.OwnerServerId;
     }
 
     /// <summary>
@@ -217,7 +223,7 @@ public class GameSession : IDisposable
         await ExecuteOnGameRoomAsync(gameRoom =>
         {
             // 계획 단계일 때 타이머가 구동 중이지 않다면 타이머 시작
-            if (gameRoom.Phase == GamePhase.Planning && _planningTimer == null)
+            if (gameRoom.Phase == GamePhase.Planning && _planningTimer == null && _backupPlanningTimer == null)
             {
                 StartPlanningTimer(gameRoom.CurrentRound);
             }
@@ -530,13 +536,40 @@ public class GameSession : IDisposable
     // 타이머 관리
     public void StartPlanningTimer(int forRound)
     {
-        StopPlanningTimer();
+        lock (_timerLock)
+        {
+            // 동일 라운드에 이미 타이머가 동작 중이면 중복 시작 방지
+            if (_planningTimerRound == forRound && (_planningTimer != null || _backupPlanningTimer != null))
+                return;
 
-        _planningTimerRound = forRound;
-        _planningTimer = new Timer(_planningTimeout.TotalMilliseconds);
-        _planningTimer.Elapsed += async (_, _) => await OnPlanningTimeoutAsync(forRound);
-        _planningTimer.AutoReset = false;
-        _planningTimer.Start();
+            // 이전 라운드 타이머 정리
+            _planningTimer?.Stop();
+            _planningTimer?.Dispose();
+            _planningTimer = null;
+            _backupPlanningTimer?.Stop();
+            _backupPlanningTimer?.Dispose();
+            _backupPlanningTimer = null;
+
+            _planningTimerRound = forRound;
+
+            if (_ownerServerId == ServerIdentity.Id)
+            {
+                _logger?.LogInformation("Starting primary planning timer for round {Round} on owner server {ServerId}", forRound, ServerIdentity.Id);
+                _planningTimer = new Timer(_planningTimeout.TotalMilliseconds);
+                _planningTimer.Elapsed += async (_, _) => await OnPlanningTimeoutAsync(forRound);
+                _planningTimer.AutoReset = false;
+                _planningTimer.Start();
+            }
+            else
+            {
+                var backupTimeout = _planningTimeout + TimeSpan.FromSeconds(5);
+                _logger?.LogInformation("Starting backup planning timer for round {Round} on passive server {ServerId} (timeout: {Timeout}ms)", forRound, ServerIdentity.Id, backupTimeout.TotalMilliseconds);
+                _backupPlanningTimer = new Timer(backupTimeout.TotalMilliseconds);
+                _backupPlanningTimer.Elapsed += async (_, _) => await OnBackupPlanningTimeoutAsync(forRound);
+                _backupPlanningTimer.AutoReset = false;
+                _backupPlanningTimer.Start();
+            }
+        }
     }
 
     private async Task OnPlanningTimeoutAsync(int forRound)
@@ -562,11 +595,50 @@ public class GameSession : IDisposable
         });
     }
 
+    private async Task OnBackupPlanningTimeoutAsync(int forRound)
+    {
+        _logger?.LogWarning("Backup timer expired for round {Round} on server {ServerId}. Checking if owner server failed...", forRound, ServerIdentity.Id);
+
+        await ExecuteOnGameRoomAsync(async gameRoom =>
+        {
+            // 여전히 계획 단계이고 라운드가 동일하다면 기존 Owner가 크래시된 것으로 판단
+            if (gameRoom.Phase != GamePhase.Planning || gameRoom.CurrentRound != forRound) 
+                return "";
+
+            _logger?.LogWarning("Takeover initiated by server {ServerId} for room {RoomId} at round {Round}", ServerIdentity.Id, RoomId, forRound);
+
+            // 주도권(Owner) 획득
+            gameRoom.AssignOwner(ServerIdentity.Id);
+
+            // 미결정 조우는 기본값(Retreat)으로 자동 처리
+            foreach (var side in new[] { PlayerSide.A, PlayerSide.B })
+            {
+                var undecided = gameRoom.GetUndecidedEncounters(side);
+                foreach (var enc in undecided)
+                {
+                    gameRoom.ResolveEncounter(enc.EdgeId, side, EncounterDecision.Retreat);
+                }
+            }
+
+            await ResolveRoundAsync(gameRoom);
+            return "";
+        });
+    }
+
     private void StopPlanningTimer()
     {
-        _planningTimer?.Stop();
-        _planningTimer?.Dispose();
-        _planningTimer = null;
+        lock (_timerLock)
+        {
+            _planningTimer?.Stop();
+            _planningTimer?.Dispose();
+            _planningTimer = null;
+
+            _backupPlanningTimer?.Stop();
+            _backupPlanningTimer?.Dispose();
+            _backupPlanningTimer = null;
+
+            _planningTimerRound = -1;
+        }
     }
 
     // 게임 종료
@@ -655,8 +727,27 @@ public class GameSession : IDisposable
                 {
                     _currentPhase = GamePhase.Planning;
                     _currentRound = resolved.CompletedRound + 1;
+                    _ownerServerId = message.SourceServerId;
+
+                    foreach (var state in _playerStates.Values)
+                        state.ResetForNewRound();
 
                     // 원격에서 라운드가 해소되었으므로 로컬 타이머 중지 및 새 라운드 타이머 구동
+                    StartPlanningTimer(_currentRound);
+                }
+            }
+            else if (message.EventType == nameof(GameStarted))
+            {
+                var started = JsonSerializer.Deserialize<GameStarted>(message.EventData.GetRawText(), DomainEventSerializerOptions.Create());
+                if (started != null)
+                {
+                    _currentPhase = GamePhase.Planning;
+                    _currentRound = 1;
+                    _ownerServerId = message.SourceServerId;
+
+                    foreach (var state in _playerStates.Values)
+                        state.ResetForNewRound();
+
                     StartPlanningTimer(_currentRound);
                 }
             }
