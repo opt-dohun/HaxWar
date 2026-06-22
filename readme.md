@@ -43,7 +43,6 @@ docker run -d -p 5051:5051 --name hexwar-game hexwar-server
 
 HexWar는 다중 서버(분산) 환경에서 실시간 게임 세션의 무상태성(Stateless)을 확보하고 동시성을 안전하게 제어하기 위해, Redis를 이용한 **분산 락(Distributed Lock)과 상태 저장소(State Store) 및 Pub/Sub 메시징** 아키텍처를 따릅니다.
 
-```
 ┌───────────────────────────────────────────────────────────────────┐
 │                          Redis Store                              │
 │                                                                   │
