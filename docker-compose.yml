@@ -50,12 +50,21 @@ services:
         reservations:
           cpus: '0.5'
           memory: '128M'
+    # 파일 디스크립터 한도 증가 (limits.conf 대체)
+    ulimits:
+      nofile:
+        soft: 20480
+        hard: 20480
+    # 커널 네트워크 튜닝 (sysctl.conf 대체)
+    sysctls:
+      net.core.somaxconn: 65535
     # 환경 변수
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:5000
       - DOTNET_GCServer=1
       - DOTNET_GCHeapCount=1
+      - DOTNET_GCLatencyMode=SustainedLowLatency # GC Latency 모드 튜닝
       - Redis__ConnectionString=redis:6379
       - ConnectionStrings__Redis=redis:6379
     # 헬스체크
@@ -91,12 +100,21 @@ services:
         reservations:
           cpus: '0.5'
           memory: '128M'
+    # 파일 디스크립터 한도 증가
+    ulimits:
+      nofile:
+        soft: 20480
+        hard: 20480
+    # 커널 네트워크 튜닝
+    sysctls:
+      net.core.somaxconn: 65535
     # 환경 변수
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:5000
       - DOTNET_GCServer=1
       - DOTNET_GCHeapCount=1
+      - DOTNET_GCLatencyMode=SustainedLowLatency
       - Redis__ConnectionString=redis:6379
       - ConnectionStrings__Redis=redis:6379
     # 헬스체크
@@ -125,6 +143,17 @@ services:
     depends_on:
       - hexwar-server-1
       - hexwar-server-2
+    # 파일 디스크립터 한도 증가
+    ulimits:
+      nofile:
+        soft: 20480
+        hard: 20480
+    # 커널 네트워크 튜닝
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 8192
+      net.ipv4.ip_local_port_range: "1024 65000"
+      net.ipv4.tcp_tw_reuse: 1
     logging:
       driver: "json-file"
       options:
