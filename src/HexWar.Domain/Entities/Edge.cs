@@ -1,28 +1,42 @@
+using ProtoBuf;
+
 namespace HexWar.Domain.Entities;
 
 using System.Text.Json.Serialization;
 using HexWar.Domain.Enums;
 using HexWar.Domain.ValueObjects;
 
+[ProtoContract]
 public class Edge
 {
     [JsonInclude]
+    [ProtoMember(1)]
     public EdgeId Id { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(2)]
     public NodeId From { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(3)]
     public NodeId To { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(4)]
     public Distance Distance { get; private set; }
 
     // 현재 간선 내 이동 중인 유닛 배치 정보
     // Key : 남은 라운드 수 Value 이동 정보
     // 라운드 별로 빠른 접근이 가능하고, 정렬되어있어 순회하기 용이함으로 해당 컬렉션 객체 선택 
     [JsonInclude]
+    [ProtoMember(5)]
     public SortedList<int, List<TravelingGroup>> TravelingUnits { get; private set; } = new();
+
+
+    private Edge()
+    {
+        // Required for protobuf-net serialization to run inline field initializers
+    }
 
     [JsonConstructor]
     public Edge(NodeId from, NodeId to, Distance distance)
@@ -32,6 +46,7 @@ public class Edge
         To = to;
         Distance = distance;
     }
+
 
     // 유닛 이동 시작 시작
     public void StartTravel(PlayerSide side, int unitCount, NodeId destination)

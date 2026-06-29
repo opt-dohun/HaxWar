@@ -1,11 +1,17 @@
 using HexWar.Domain.Enums;
+using ProtoBuf;
 
 namespace HexWar.Domain.ValueObjects;
 
+[ProtoContract]
 public readonly record struct EdgeId
 {
+    [ProtoMember(1)]
     public NodeId From { get; }
+
+    [ProtoMember(2)]
     public NodeId To { get; }
+
 
     public EdgeId(NodeId from, NodeId to)
     {

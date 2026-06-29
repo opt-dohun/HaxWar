@@ -2,6 +2,8 @@
 namespace HexWar.Infrastructure.Persistence;
 
 using System.Text.Json;
+using System.Buffers;
+using ProtoBuf;
 using HexWar.Application.Services;
 using HexWar.Domain.Entities;
 using HexWar.Infrastructure.Serialization;
@@ -55,7 +57,7 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
 
             if (value.IsNullOrEmpty) return null;
 
-            var gameRoom = JsonSerializer.Deserialize<GameRoom>(value!, JsonOptions);
+            var gameRoom = Serializer.Deserialize<GameRoom>(new ReadOnlySpan<byte>((byte[])value!));
 
             if (gameRoom != null)
             {
@@ -79,24 +81,25 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
         {
             var key = GetRoomKey(gameRoom.RoomId);
 
-            // DomainJsonOptions 사용
-            var json = JsonSerializer.Serialize(gameRoom, JsonOptions);
+            var writer = new ArrayBufferWriter<byte>();
+            Serializer.Serialize(writer, gameRoom);
 
             _logger.LogDebug(
-                "Saving GameRoom {RoomId}: {JsonLength} bytes",
-                gameRoom.RoomId, json.Length);
+                "Saving GameRoom {RoomId}: {ByteLength} bytes (Protobuf)",
+                gameRoom.RoomId, writer.WrittenCount);
 
             var expiry = gameRoom.Phase == Domain.Enums.GamePhase.GameOver
                 ? TimeSpan.FromMinutes(_config.GameOverExpiryMinutes)
                 : TimeSpan.FromMinutes(_config.GameSessionExpiryMinutes);
 
-            await _db.StringSetAsync(key, json, expiry);
+            await _db.StringSetAsync(key, writer.WrittenMemory, expiry);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to serialize/save GameRoom {RoomId}", gameRoom.RoomId);
         }
     }
+
 
     public async Task<bool> ExistsAsync(string roomId)
     {
@@ -124,10 +127,12 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
             ConnectedAt = DateTime.UtcNow
         };
 
-        var json = JsonSerializer.Serialize(sessionInfo, JsonOptions);
+        var writer = new ArrayBufferWriter<byte>();
+        Serializer.Serialize(writer, sessionInfo);
+
         await _db.StringSetAsync(
             $"player:{playerId}",
-            json,
+            writer.WrittenMemory,
             TimeSpan.FromMinutes(30)); // 30분 TTL
     }
 
@@ -139,9 +144,10 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
         var value = await _db.StringGetAsync($"player:{playerId}");
         if (value.IsNullOrEmpty) return null;
 
-        var session = JsonSerializer.Deserialize<PlayerSessionInfo>(value!, JsonOptions);
+        var session = Serializer.Deserialize<PlayerSessionInfo>(new ReadOnlySpan<byte>((byte[])value!));
         return session?.RoomId;
     }
+
 
     /// <summary>
     /// 활성 게임방 목록 조회
@@ -193,13 +199,18 @@ public class RedisGameRoomRepository : IGameRoomRepository, IDisposable
     }
 }
 
-/// <summary>
-/// Redis에 저장되는 플레이어 세션 정보
-/// </summary>
+[ProtoContract]
 public class PlayerSessionInfo
 {
+    [ProtoMember(1)]
     public string RoomId { get; set; } = string.Empty;
+
+    [ProtoMember(2)]
     public string PlayerSide { get; set; } = string.Empty;
+
+    [ProtoMember(3)]
     public string ServerId { get; set; } = string.Empty;
+
+    [ProtoMember(4)]
     public DateTime ConnectedAt { get; set; }
 }

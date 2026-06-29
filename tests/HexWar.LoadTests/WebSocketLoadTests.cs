@@ -332,12 +332,12 @@ public class WebSocketLoadTests
         var getStateMessage = new { type = "get_state" };
         await SendJsonAsync(client, getStateMessage, ct);
 
-        // GameStarted 이벤트 수신 대기
+        // GameStarted 또는 GameState 이벤트 수신 대기
         var timeout = DateTime.UtcNow.AddSeconds(10);
         while (DateTime.UtcNow < timeout)
         {
             var message = await ReceiveMessageAsync(client, buffer, ct);
-            if (message?.EventType == "GameStarted") break;
+            if (message?.EventType == "GameStarted" || message?.EventType == "GameState") break;
             await Task.Delay(100, ct);
         }
     }

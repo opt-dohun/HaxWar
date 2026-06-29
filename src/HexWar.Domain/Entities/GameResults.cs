@@ -1,3 +1,5 @@
+using ProtoBuf;
+
 namespace HexWar.Domain.Entities;
 
 using HexWar.Domain.Enums;
@@ -19,33 +21,48 @@ public class RoundResolutionResult
 }
 
 
+[ProtoContract]
 public class PendingEncounter
 {
     [JsonInclude]
+    [ProtoMember(1)]
     public EdgeId EdgeId { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(2)]
     public TravelingGroup GroupA { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(3)]
     public TravelingGroup GroupB { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(4)]
     public int RemainingRounds { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(5)]
     public EncounterDecision? DecisionA { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(6)]
     public EncounterDecision? DecisionB { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(7)]
     public EncounterOutcome? OutcomeA { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(8)]
     public EncounterOutcome? OutcomeB { get; private set; }
 
+
     public bool BothDecided => DecisionA.HasValue && DecisionB.HasValue;
+
+    private PendingEncounter()
+    {
+        // Required for protobuf-net serialization
+    }
 
     [JsonConstructor]
     public PendingEncounter(EdgeId edgeId, TravelingGroup groupA, TravelingGroup groupB, int remainingRounds)
@@ -55,6 +72,7 @@ public class PendingEncounter
         GroupB = groupB;
         RemainingRounds = remainingRounds;
     }
+
 
     public void MarkDecided(PlayerSide side, EncounterDecision decision, EncounterOutcome outcome)
     {

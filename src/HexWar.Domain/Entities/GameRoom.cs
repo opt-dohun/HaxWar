@@ -1,3 +1,5 @@
+using ProtoBuf;
+
 namespace HexWar.Domain.Entities;
 
 using System.Text.Json.Serialization;
@@ -7,12 +9,15 @@ using HexWar.Domain.Events;
 using HexWar.Domain.Exceptions;
 using HexWar.Domain.ValueObjects;
 
+[ProtoContract]
 public partial class GameRoom
 {
     [JsonInclude]
+    [ProtoMember(1)]
     public string RoomId { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(2)]
     public string? OwnerServerId { get; private set; }
 
     public void AssignOwner(string serverId)
@@ -21,26 +26,33 @@ public partial class GameRoom
     }
 
     [JsonInclude]
+    [ProtoMember(3)]
     public GamePhase Phase { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(4)]
     public int CurrentRound { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(5)]
     public int MaxRounds { get; private set; } = 20;
 
     // 순차적 접근이 필요하지 않음으로 index 기반의 리스트보다 Dictionary가 더 적합함
     [JsonInclude]
+    [ProtoMember(6)]
     public Dictionary<NodeId, Node> Nodes { get; private set; } = new();
 
     [JsonInclude]
+    [ProtoMember(7)]
     public Dictionary<EdgeId, Edge> Edges { get; private set; } = new();
 
     [JsonInclude]
+    [ProtoMember(8)]
     public Dictionary<PlayerSide, PlayerId> Players { get; private set; } = new();
 
     // 라운드에 소모한 유닛 수 파악용
     [JsonInclude]
+    [ProtoMember(9, OverwriteList = true)]
     public Dictionary<PlayerSide, int> UnitUsedThisRound { get; private set; } = new()
     {
         { PlayerSide.A, 0 },
@@ -50,6 +62,7 @@ public partial class GameRoom
     // Planning 단계에서 예약된 이동 명령 (취소 불가)
     [JsonInclude]
     [JsonPropertyName("pendingMoves")]
+    [ProtoMember(10, OverwriteList = true)]
     private Dictionary<PlayerSide, List<PendingMove>> _pendingMoves = new()
     {
         { PlayerSide.A, new List<PendingMove>() },
@@ -63,15 +76,23 @@ public partial class GameRoom
 
     // 조우 이벤트 목록
     [JsonInclude]
+    [ProtoMember(11)]
     public List<PendingEncounter> PendingEncounters { get; private set; } = new();
 
     // 조우 결정 완료 여부
     [JsonInclude]
+    [ProtoMember(12, OverwriteList = true)]
     public Dictionary<PlayerSide, bool> EncounterDecisionReady { get; private set; } = new()
     {
         { PlayerSide.A, false },
         { PlayerSide.B, false }
     };
+
+
+    private GameRoom()
+    {
+        // Required for protobuf-net serialization to run inline field initializers
+    }
 
     // 생성자 함수를 통한 기본 상태 정의
     [JsonConstructor]
@@ -80,6 +101,7 @@ public partial class GameRoom
         RoomId = roomId;
         Phase = GamePhase.WatingForPlayers;
     }
+
 
 
     // 게임 설정 단계 정의
@@ -329,4 +351,12 @@ public partial class GameRoom
     }
 }
 
-public record PendingMove(NodeId From, NodeId To, int Count);
+[ProtoContract]
+public record PendingMove(
+    [property: ProtoMember(1)] NodeId From, 
+    [property: ProtoMember(2)] NodeId To, 
+    [property: ProtoMember(3)] int Count
+)
+{
+    private PendingMove() : this(default, default, default) { }
+}

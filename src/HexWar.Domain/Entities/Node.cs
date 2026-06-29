@@ -1,28 +1,36 @@
+using ProtoBuf;
+
 namespace HexWar.Domain.Entities;
 
 using System.Text.Json.Serialization;
 using HexWar.Domain.Enums;
 using HexWar.Domain.ValueObjects;
 
+[ProtoContract]
 public class Node
 {
     [JsonInclude]
+    [ProtoMember(1)]
     public NodeId Id { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(2)]
     public string Name { get; private set; }
 
     [JsonInclude]
+    [ProtoMember(3)]
     public NodeType Type { get; private set; } // 전초기지 유형 표현 추가
     public bool IsHeadquarters => Type == NodeType.Headquarters;
     public bool IsSupplyLine => Type == NodeType.SupplyLine;
 
     // 점유 상태
     [JsonInclude]
+    [ProtoMember(4)]
     public NodeOwnership Ownership { get; set; }
 
     // 각 플레이어별 유닛 그룹
     [JsonInclude]
+    [ProtoMember(5, OverwriteList = true)]
     public Dictionary<PlayerSide, UnitGroup> Units { get; private set; } = new()
     {
         { PlayerSide.A , new UnitGroup(PlayerSide.A)  },
@@ -31,11 +39,18 @@ public class Node
 
     // 이웃한 노드 정보 List
     [JsonInclude]
+    [ProtoMember(6)]
     public List<NodeId> Neighbors { get; private set; } = new();
 
     // 이번 라운드 출발 정보 (상대방에게 공개될 리스트)
     [JsonInclude]
+    [ProtoMember(7)]
     public List<DepartureAnnouncement> RecentDepartures { get; private set; } = new();
+
+    private Node()
+    {
+        // Required for protobuf-net serialization to run inline field initializers
+    }
 
     [JsonConstructor]
     public Node(NodeId id, string name, NodeType type = NodeType.OutPost)
@@ -45,6 +60,7 @@ public class Node
         Type = type;
         Ownership = NodeOwnership.Neutral;
     }
+
     public int GetMobileCount(PlayerSide side) => Units[side].MobileCount;
     public int GetTotalCount(PlayerSide side) => Units[side].TotalCount;
 
@@ -145,4 +161,11 @@ public class Node
     }
 }
 
-public record DepartureAnnouncement(NodeId FromNode, int UnitCount);
+[ProtoContract]
+public record DepartureAnnouncement(
+    [property: ProtoMember(1)] NodeId FromNode, 
+    [property: ProtoMember(2)] int UnitCount
+)
+{
+    private DepartureAnnouncement() : this(default, default) { }
+}
