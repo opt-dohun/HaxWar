@@ -9,6 +9,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="protobuf-net" Version="3.2.56" />
     <PackageReference Include="StackExchange.Redis" Version="2.13.17" />
   </ItemGroup>
 
